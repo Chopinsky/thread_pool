@@ -36,7 +36,7 @@ fn main() {
 The package also provide a static pool which you can create once, and use it everywhere in your application. 
 This is called the `shared_mode`: 
 ```rust
-extern crate thread_pool;
+extern crate threads_pool;
 
 use std::time::Duration;
 use std::thread::sleep;
