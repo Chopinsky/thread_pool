@@ -1,5 +1,6 @@
 [package]
 name = "thread_pool"
+description = "This package provides an easy way to create and manage thread pools, so you don't have to."
 authors = ["Jacob Zuo <jacob.dzwo@gmail.com>"]
 version = "0.1.0"
 readme = "README.md"
