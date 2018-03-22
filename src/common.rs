@@ -169,23 +169,24 @@ impl Worker {
     }
 
     fn launch(my_id: usize, receiver: Arc<Mutex<mpsc::Receiver<Message>>>) {
-        loop {
-            let mut new_job: Option<Job> = None;
+        let mut next_message: Option<Message> = None;
 
+        loop {
             if let Ok(rx) = receiver.lock() {
                 if let Ok(message) = rx.recv() {
-                    match message {
-                        Message::NewJob(job) => new_job = Some(job),
-                        Message::Terminate(id) => {
-                            if id == 0 { break; }
-                            if my_id == id { break; }
-                        }
-                    }
+                    // grab the message and release the queue, so we don't block the queue.
+                    next_message = Some(message);
                 }
             }
 
-            if let Some(job) = new_job {
-                job.call_box();
+            if let Some(msg) = next_message.take() {
+                match msg {
+                    Message::NewJob(job) => job.call_box(),
+                    Message::Terminate(id) => {
+                        if id == 0 { break; }
+                        if my_id == id { break; }
+                    }
+                }
             }
         }
     }

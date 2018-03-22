@@ -6,7 +6,7 @@ pub mod shared_mode {
     pub use single_pool::{close, initialize, run};
 }
 
-pub mod keyed_mode {
+pub mod index_mode {
     pub use multi_pools::{close, initialize, run};
 }
 

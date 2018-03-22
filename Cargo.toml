@@ -1,6 +1,10 @@
 [package]
 name = "thread_pool"
-version = "0.1.0"
 authors = ["Jacob Zuo <jacob.dzwo@gmail.com>"]
+version = "0.1.0"
+readme = "README.md"
+documentation = "https://docs.rs/thread_pool/"
+repository = "https://github.com/Chopinsky/thread_pool.git"
+license = "MIT"
 
 [dependencies]
