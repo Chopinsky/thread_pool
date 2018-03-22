@@ -1,9 +1,9 @@
-extern crate thread_pool;
+extern crate threads_pool;
 
 use std::collections::HashMap;
 use std::time::Duration;
 use std::thread;
-use thread_pool::index_mode;
+use threads_pool::index_mode;
 
 fn main() {
     let key_one = String::from("pool_one");

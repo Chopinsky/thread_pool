@@ -1,4 +1,4 @@
-# Thread Pool
+# Threads Pool
 
 This package provides an easy way to create and manage thread pools, so you don't have to. 
 

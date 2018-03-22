@@ -1,8 +1,8 @@
-extern crate thread_pool;
+extern crate threads_pool;
 
 use std::time::Duration;
 use std::thread::sleep;
-use thread_pool::shared_mode;
+use threads_pool::shared_mode;
 
 fn main() {
     shared_mode::initialize(4);
