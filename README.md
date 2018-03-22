@@ -6,16 +6,16 @@ This package provides an easy way to create and manage thread pools, so you don'
 In your project's `Cargo.toml`, add dependency:
 ```cargo
 [dependencies]
-thread_pool = "^0.1.0"
+threads_pool = "^0.1.0"
 ```
 
 Then in your code: 
 ```rust
-extern crate thread_pool;
+extern crate threads_pool;
 
 use std::time::Duration;
 use std::thread::sleep;
-use thread_pool::*;
+use threads_pool::*;
 
 fn main() {
     // The pool lives as long as the `pool` variable, when pool goes out of 
@@ -40,7 +40,7 @@ extern crate thread_pool;
 
 use std::time::Duration;
 use std::thread::sleep;
-use thread_pool::shared_mode;
+use threads_pool::shared_mode;
 
 fn main() {
     // Create the pool here, then you can use the pool everywhere. If run a task without 
