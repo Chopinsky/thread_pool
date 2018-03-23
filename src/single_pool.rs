@@ -1,7 +1,9 @@
+#![allow(dead_code)]
+
 use std::mem;
 use std::thread;
 use std::sync::{Once, ONCE_INIT};
-use super::common::ThreadPool;
+use super::common::{PoolManager, ThreadPool};
 
 static ONCE: Once = ONCE_INIT;
 static mut POOL: Option<Pool> = None;
@@ -22,13 +24,7 @@ pub fn initialize(size: usize) {
         }
 
         ONCE.call_once(|| {
-            // Make the pool
-            let pool = Some(Pool {
-                store: Box::new(ThreadPool::new(pool_size))
-            });
-
-            // Put it in the heap so it can outlive this call
-            POOL = mem::transmute(pool);
+            create(pool_size);
         });
     }
 }
@@ -52,5 +48,33 @@ pub fn close() {
             pool.store.clear();
             drop(pool);
         }
+    }
+}
+
+pub fn resize(size: usize) {
+    if size == 0 {
+        close();
+    }
+
+    unsafe {
+        if let Some(ref mut pool) = POOL {
+            pool.store.resize(size);
+        } else {
+            create(size);
+        }
+    }
+}
+
+fn create(size: usize) {
+    if size == 0 { return; }
+
+    unsafe {
+        // Make the pool
+        let pool = Some(Pool {
+            store: Box::new(ThreadPool::new(size))
+        });
+
+        // Put it in the heap so it can outlive this call
+        POOL = mem::transmute(pool);
     }
 }

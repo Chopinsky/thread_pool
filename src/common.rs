@@ -55,35 +55,68 @@ impl ThreadPool {
             println!("Unable to distribute the job: {}", err);
         });
     }
+}
 
-    pub fn extend(&mut self, size: usize) {
-        if size == 0 { return; }
+pub trait PoolManager {
+    fn extend(&mut self, more: usize);
+    fn shrink(&mut self, less: usize);
+    fn resize(&mut self, size: usize);
+    fn kill_worker(&mut self, id: usize);
+    fn clear(&mut self);
+}
+
+impl PoolManager for ThreadPool {
+    fn extend(&mut self, more: usize) {
+        if more == 0 { return; }
 
         // the start id is the next integer from the last worker's id
         let start = self.last_id + 1;
 
-        for id in 0..size {
+        for id in 0..more {
             let worker = Worker::new((start + id), Arc::clone(&self.receiver));
             self.workers.push(worker);
         }
 
-        self.last_id += size;
+        self.last_id += more;
     }
 
-    pub fn kill_worker(&mut self, id: usize) {
+    fn shrink(&mut self, less: usize) {
+        if less == 0 { return; }
+
+        let mut count = less;
+        while count > 0 {
+            if self.workers.len() == 0 {
+                break;
+            } else {
+                count -= 1;
+            }
+
+            if let Some(mut worker) = self.workers.pop() {
+                Worker::terminate(&self, &mut worker);
+            }
+        }
+    }
+
+    fn resize(&mut self, size: usize) {
+        let len = self.workers.len();
+
+        if size == len {
+            return;
+        } else if size > len {
+            self.extend(size - len);
+        } else {
+            self.shrink(len - size);
+        }
+    }
+
+    fn kill_worker(&mut self, id: usize) {
         let mut index = 0;
 
         while index < self.workers.len() {
             if self.workers[index].id == id {
+                // swap out the worker, use swap_remove for better performance.
                 let mut worker = self.workers.swap_remove(index);
-
-                self.sender.send(Message::Terminate(id)).unwrap_or_else(|err| {
-                    println!("Unable to send message: {}", err);
-                });
-
-                if let Some(thread) = worker.thread.take() {
-                    thread.join().expect("Couldn't join on the associated thread");
-                }
+                Worker::terminate(&self, &mut worker);
 
                 return;
             }
@@ -92,7 +125,7 @@ impl ThreadPool {
         }
     }
 
-    pub fn clear(&mut self) {
+    fn clear(&mut self) {
         for _ in &mut self.workers {
             self.sender.send(Message::Terminate(0)).unwrap_or_else(|err| {
                 println!("Unable to send message: {}", err);
@@ -108,12 +141,18 @@ impl ThreadPool {
 }
 
 pub trait PoolState {
+    fn get_size(&self) -> usize;
     fn get_first_worker_id(&self) -> Option<usize>;
     fn get_last_worker_id(&self) -> Option<usize>;
     fn get_next_worker_id(&self, id: usize) -> Option<usize>;
 }
 
 impl PoolState for ThreadPool {
+    #[inline]
+    fn get_size(&self) -> usize {
+        self.workers.len()
+    }
+
     fn get_first_worker_id(&self) -> Option<usize> {
         if let Some(worker) = self.workers.first() {
             return Some(worker.id)
@@ -188,6 +227,16 @@ impl Worker {
                     }
                 }
             }
+        }
+    }
+
+    fn terminate(pool: &ThreadPool, worker: &mut Worker) {
+        pool.sender.send(Message::Terminate(worker.id)).unwrap_or_else(|err| {
+            println!("Unable to send message: {}", err);
+        });
+
+        if let Some(thread) = worker.thread.take() {
+            thread.join().expect("Couldn't join on the associated thread");
         }
     }
 }

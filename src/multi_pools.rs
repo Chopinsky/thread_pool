@@ -1,8 +1,10 @@
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 use std::mem;
 use std::thread;
 use std::sync::{Once, ONCE_INIT};
-use super::common::ThreadPool;
+use super::common::{PoolManager, ThreadPool};
 
 static ONCE: Once = ONCE_INIT;
 static mut MUTLTI_POOL: Option<PoolStore> = None;
@@ -64,3 +66,24 @@ pub fn close() {
         }
     }
 }
+
+pub fn resize(pool_key: String, size: usize) {
+
+//TODO: implement this function
+
+//    if  { }
+//
+//    if size == 0 {
+//        close();
+//    }
+//
+//    unsafe {
+//        if let Some(ref mut pool) = POOL {
+//            pool.store.resize(size);
+//        } else {
+//            create(size);
+//        }
+//    }
+}
+
+//TODO: impl many things in single mode
