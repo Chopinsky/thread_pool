@@ -52,17 +52,19 @@ pub fn close() {
 }
 
 pub fn resize(size: usize) {
-    if size == 0 {
-        close();
-    }
-
-    unsafe {
-        if let Some(ref mut pool) = POOL {
-            pool.store.resize(size);
-        } else {
-            create(size);
+    thread::spawn(move || {
+        if size == 0 {
+            close();
         }
-    }
+
+        unsafe {
+            if let Some(ref mut pool) = POOL {
+                pool.store.resize(size);
+            } else {
+                create(size);
+            }
+        }
+    });
 }
 
 fn create(size: usize) {

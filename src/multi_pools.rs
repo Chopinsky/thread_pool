@@ -4,10 +4,10 @@ use std::collections::HashMap;
 use std::mem;
 use std::thread;
 use std::sync::{Once, ONCE_INIT};
-use super::common::{PoolManager, ThreadPool};
+use super::common::{PoolManager, PoolState, ThreadPool};
 
 static ONCE: Once = ONCE_INIT;
-static mut MUTLTI_POOL: Option<PoolStore> = None;
+static mut MULTI_POOL: Option<PoolStore> = None;
 
 struct PoolStore {
     store: HashMap<String, Box<ThreadPool>>,
@@ -19,7 +19,7 @@ pub fn initialize(keys: HashMap<String, usize>) {
     }
 
     unsafe {
-        if MUTLTI_POOL.is_some() {
+        if MULTI_POOL.is_some() {
             panic!("You are trying to initialize the thread pools multiple times!");
         }
 
@@ -37,14 +37,14 @@ pub fn initialize(keys: HashMap<String, usize>) {
             let pool = Some(PoolStore { store });
 
             // Put it in the heap so it can outlive this call
-            MUTLTI_POOL = mem::transmute(pool);
+            MULTI_POOL = mem::transmute(pool);
         });
     }
 }
 
 pub fn run<F>(pool_key: String, f: F) where F: FnOnce() + Send + 'static {
     unsafe {
-        if let Some(ref pool) = MUTLTI_POOL {
+        if let Some(ref pool) = MULTI_POOL {
             // if pool has been created
             if let Some(worker_pool) = pool.store.get(&pool_key) {
                 worker_pool.execute(f);
@@ -59,7 +59,7 @@ pub fn run<F>(pool_key: String, f: F) where F: FnOnce() + Send + 'static {
 
 pub fn close() {
     unsafe {
-        if let Some(pool) = MUTLTI_POOL.take() {
+        if let Some(pool) = MULTI_POOL.take() {
             for (_, mut pool) in pool.store {
                 pool.clear();
             }
@@ -67,23 +67,42 @@ pub fn close() {
     }
 }
 
-pub fn resize(pool_key: String, size: usize) {
-
-//TODO: implement this function
-
-//    if  { }
-//
-//    if size == 0 {
-//        close();
-//    }
-//
-//    unsafe {
-//        if let Some(ref mut pool) = POOL {
-//            pool.store.resize(size);
-//        } else {
-//            create(size);
-//        }
-//    }
+pub fn resize_pool(pool_key: String, size: usize) {
+    //TODO: implement this function
 }
 
-//TODO: impl many things in single mode
+pub fn remove_pool(key: String) {
+    if key.is_empty() { return; }
+
+    thread::spawn(move || {
+        unsafe {
+            if let Some(ref mut pools) = MULTI_POOL {
+                if let Some(mut pool) = pools.store.remove(&key) {
+                    pool.clear();
+                }
+            }
+        }
+    });
+}
+
+pub fn add_pool(key: String, size: usize) {
+    if key.is_empty() || size == 0 { return; }
+
+    thread::spawn(move || {
+       unsafe {
+           if let Some(ref mut pools) = MULTI_POOL {
+               if let Some(mut pool) = pools.store.get_mut(&key) {
+                   if pool.get_size() != size {
+                       pool.resize(size);
+                   }
+
+                   return;
+               }
+
+               let new_pool = Box::new(ThreadPool::new(size));
+               pools.store.insert(key, new_pool);
+
+           }
+       }
+    });
+}
