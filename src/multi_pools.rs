@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::mem;
 use std::thread;
+use std::thread::JoinHandle;
 use std::sync::{Once, ONCE_INIT};
 use super::common::{PoolManager, PoolState, ThreadPool};
 
@@ -42,7 +43,7 @@ pub fn initialize(keys: HashMap<String, usize>) {
     }
 }
 
-pub fn run<F>(pool_key: String, f: F) where F: FnOnce() + Send + 'static {
+pub fn run_with<F>(pool_key: String, f: F) where F: FnOnce() + Send + 'static {
     unsafe {
         if let Some(ref pool) = MULTI_POOL {
             // if pool has been created
@@ -71,10 +72,10 @@ pub fn resize_pool(pool_key: String, size: usize) {
     //TODO: implement this function
 }
 
-pub fn remove_pool(key: String) {
-    if key.is_empty() { return; }
+pub fn remove_pool(key: String) -> Option<JoinHandle<()>> {
+    if key.is_empty() { return None; }
 
-    thread::spawn(move || {
+    let handler = thread::spawn(move || {
         unsafe {
             if let Some(ref mut pools) = MULTI_POOL {
                 if let Some(mut pool) = pools.store.remove(&key) {
@@ -83,12 +84,14 @@ pub fn remove_pool(key: String) {
             }
         }
     });
+
+    Some(handler)
 }
 
-pub fn add_pool(key: String, size: usize) {
-    if key.is_empty() || size == 0 { return; }
+pub fn add_pool(key: String, size: usize) -> Option<JoinHandle<()>> {
+    if key.is_empty() || size == 0 { return None; }
 
-    thread::spawn(move || {
+    let handler = thread::spawn(move || {
        unsafe {
            if let Some(ref mut pools) = MULTI_POOL {
                if let Some(mut pool) = pools.store.get_mut(&key) {
@@ -105,4 +108,6 @@ pub fn add_pool(key: String, size: usize) {
            }
        }
     });
+
+    Some(handler)
 }

@@ -2,6 +2,7 @@
 
 use std::mem;
 use std::thread;
+use std::thread::JoinHandle;
 use std::sync::{Once, ONCE_INIT};
 use super::common::{PoolManager, ThreadPool};
 
@@ -51,7 +52,7 @@ pub fn close() {
     }
 }
 
-pub fn resize(size: usize) {
+pub fn resize(size: usize) -> JoinHandle<()> {
     thread::spawn(move || {
         if size == 0 {
             close();
@@ -64,7 +65,7 @@ pub fn resize(size: usize) {
                 create(size);
             }
         }
-    });
+    })
 }
 
 fn create(size: usize) {

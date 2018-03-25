@@ -18,7 +18,7 @@ fn main() {
     let t1 = thread::spawn(move || {
         for num in 0..50 {
             let pool_key = key_one.clone();
-            index_mode::run(pool_key, move || {
+            index_mode::run_with(pool_key, move || {
                 println!("I'm in with key_one: {}", num);
                 thread::sleep(Duration::from_millis(1));
             });
@@ -28,7 +28,7 @@ fn main() {
     let t2 = thread::spawn(move || {
         for num in 0..100 {
             let pool_key = key_two.clone();
-            index_mode::run(pool_key, move || {
+            index_mode::run_with(pool_key, move || {
                 println!("I'm in with key_two: {}", num);
                 thread::sleep(Duration::from_millis(1));
             });
