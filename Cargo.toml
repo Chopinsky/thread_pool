@@ -9,3 +9,4 @@ repository = "https://github.com/Chopinsky/thread_pool.git"
 license = "MIT"
 
 [dependencies]
+lazy_static = "^1.0"

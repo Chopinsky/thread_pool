@@ -1,6 +1,8 @@
-pub mod common;
 mod single_pool;
 mod multi_pools;
+mod debug;
+
+pub mod common;
 
 pub mod shared_mode {
     pub use single_pool::{close, initialize, resize, run};

@@ -1,5 +1,6 @@
 use std::thread;
 use std::sync::{Arc, mpsc, Mutex};
+use debug::is_debug_mode;
 
 type Job = Box<FnBox + Send + 'static>;
 
@@ -41,6 +42,10 @@ impl ThreadPool {
             workers.push(Worker::new((start + id), Arc::clone(&receiver)));
         }
 
+        if is_debug_mode() {
+            println!("Pool has been initialized with {} pools", workers.len());
+        }
+
         ThreadPool {
             workers,
             last_id: start + pool_size - 1,
@@ -52,7 +57,7 @@ impl ThreadPool {
     pub fn execute<F>(&self, f: F) where F: FnOnce() + Send + 'static {
         let job = Box::new(f);
         self.sender.send(Message::NewJob(job)).unwrap_or_else(|err| {
-            println!("Unable to distribute the job: {}", err);
+            eprintln!("Unable to distribute the job: {}", err);
         });
     }
 }
@@ -128,7 +133,7 @@ impl PoolManager for ThreadPool {
     fn clear(&mut self) {
         for _ in &mut self.workers {
             self.sender.send(Message::Terminate(0)).unwrap_or_else(|err| {
-                println!("Unable to send message: {}", err);
+                eprintln!("Unable to send message: {}", err);
             });
         }
 
@@ -184,7 +189,9 @@ impl PoolState for ThreadPool {
 
 impl Drop for ThreadPool {
     fn drop(&mut self) {
-        println!("Job done, sending terminate message to all workers.");
+        if is_debug_mode() {
+            println!("Job done, sending terminate message to all workers.");
+        }
 
         self.clear();
     }
@@ -232,7 +239,7 @@ impl Worker {
 
     fn terminate(pool: &ThreadPool, worker: &mut Worker) {
         pool.sender.send(Message::Terminate(worker.id)).unwrap_or_else(|err| {
-            println!("Unable to send message: {}", err);
+            eprintln!("Unable to send message: {}", err);
         });
 
         if let Some(thread) = worker.thread.take() {
