@@ -69,7 +69,17 @@ pub fn close() {
 }
 
 pub fn resize_pool(pool_key: String, size: usize) {
-    //TODO: implement this function
+    if pool_key.is_empty() { return; }
+
+    thread::spawn(move || {
+        unsafe {
+            if let Some(ref mut pools) = MULTI_POOL {
+                if let Some(pool) = pools.store.get_mut(&pool_key) {
+                    pool.resize(size);
+                }
+            }
+        }
+    });
 }
 
 pub fn remove_pool(key: String) -> Option<JoinHandle<()>> {
