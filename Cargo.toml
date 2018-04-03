@@ -2,11 +2,10 @@
 name = "threads_pool"
 description = "This package provides an easy way to create and manage thread pools, so you don't have to."
 authors = ["Jacob Zuo <chopinsky@live.com>"]
-version = "0.1.2"
+version = "0.1.3"
 readme = "README.md"
 documentation = "https://docs.rs/thread_pool/"
 repository = "https://github.com/Chopinsky/thread_pool.git"
 license = "MIT"
 
 [dependencies]
-lazy_static = "^1.0"

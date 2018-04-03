@@ -39,7 +39,7 @@ impl ThreadPool {
 
         let mut workers = Vec::with_capacity(pool_size);
         for id in 0..pool_size {
-            workers.push(Worker::new((start + id), Arc::clone(&receiver)));
+            workers.push(Worker::new(start + id, Arc::clone(&receiver)));
         }
 
         if is_debug_mode() {
@@ -78,7 +78,7 @@ impl PoolManager for ThreadPool {
         let start = self.last_id + 1;
 
         for id in 0..more {
-            let worker = Worker::new((start + id), Arc::clone(&self.receiver));
+            let worker = Worker::new(start + id, Arc::clone(&self.receiver));
             self.workers.push(worker);
         }
 

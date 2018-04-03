@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::mem;
 use std::thread;
 use std::thread::JoinHandle;
