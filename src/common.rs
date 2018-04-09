@@ -1,5 +1,5 @@
 use std::thread;
-use std::sync::{Arc, mpsc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use debug::is_debug_mode;
 
 type Job = Box<FnBox + Send + 'static>;
@@ -54,11 +54,16 @@ impl ThreadPool {
         }
     }
 
-    pub fn execute<F>(&self, f: F) where F: FnOnce() + Send + 'static {
+    pub fn execute<F>(&self, f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
         let job = Box::new(f);
-        self.sender.send(Message::NewJob(job)).unwrap_or_else(|err| {
-            eprintln!("Unable to distribute the job: {}", err);
-        });
+        self.sender
+            .send(Message::NewJob(job))
+            .unwrap_or_else(|err| {
+                eprintln!("Unable to distribute the job: {}", err);
+            });
     }
 }
 
@@ -72,7 +77,9 @@ pub trait PoolManager {
 
 impl PoolManager for ThreadPool {
     fn extend(&mut self, more: usize) {
-        if more == 0 { return; }
+        if more == 0 {
+            return;
+        }
 
         // the start id is the next integer from the last worker's id
         let start = self.last_id + 1;
@@ -86,7 +93,9 @@ impl PoolManager for ThreadPool {
     }
 
     fn shrink(&mut self, less: usize) {
-        if less == 0 { return; }
+        if less == 0 {
+            return;
+        }
 
         let mut count = less;
         while count > 0 {
@@ -132,14 +141,18 @@ impl PoolManager for ThreadPool {
 
     fn clear(&mut self) {
         for _ in &mut self.workers {
-            self.sender.send(Message::Terminate(0)).unwrap_or_else(|err| {
-                eprintln!("Unable to send message: {}", err);
-            });
+            self.sender
+                .send(Message::Terminate(0))
+                .unwrap_or_else(|err| {
+                    eprintln!("Unable to send message: {}", err);
+                });
         }
 
         for worker in &mut self.workers {
             if let Some(thread) = worker.thread.take() {
-                thread.join().expect("Couldn't join on the associated thread");
+                thread
+                    .join()
+                    .expect("Couldn't join on the associated thread");
             }
         }
     }
@@ -160,7 +173,7 @@ impl PoolState for ThreadPool {
 
     fn get_first_worker_id(&self) -> Option<usize> {
         if let Some(worker) = self.workers.first() {
-            return Some(worker.id)
+            return Some(worker.id);
         }
 
         None
@@ -168,19 +181,25 @@ impl PoolState for ThreadPool {
 
     fn get_last_worker_id(&self) -> Option<usize> {
         if let Some(worker) = self.workers.last() {
-            return Some(worker.id)
+            return Some(worker.id);
         }
 
         None
     }
 
     fn get_next_worker_id(&self, current_id: usize) -> Option<usize> {
-        if current_id >= self.workers.len() { return None; }
+        if current_id >= self.workers.len() {
+            return None;
+        }
 
         let mut found = false;
         for worker in &self.workers {
-            if found { return Some(worker.id) }
-            if worker.id == current_id { found = true; }
+            if found {
+                return Some(worker.id);
+            }
+            if worker.id == current_id {
+                found = true;
+            }
         }
 
         None
@@ -203,47 +222,50 @@ struct Worker {
 }
 
 impl Worker {
-    fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Message>>>) -> Worker {
+    fn new(my_id: usize, receiver: Arc<Mutex<mpsc::Receiver<Message>>>) -> Worker {
         let thread = thread::spawn(move || {
-            Worker::launch(id, receiver);
+            let mut new_assignment = None;
+
+            loop {
+                if let Ok(rx) = receiver.lock() {
+                    if let Ok(message) = rx.recv() {
+                        new_assignment = Some(message);
+                    }
+                }
+
+                if let Some(message) = new_assignment.take() {
+                    match message {
+                        Message::NewJob(job) => job.call_box(),
+                        Message::Terminate(job_id) => {
+                            if job_id == 0 {
+                                break;
+                            }
+                            if job_id == my_id {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
         });
 
         Worker {
-            id,
+            id: my_id,
             thread: Some(thread),
         }
     }
 
-    fn launch(my_id: usize, receiver: Arc<Mutex<mpsc::Receiver<Message>>>) {
-        let mut next_message: Option<Message> = None;
-
-        loop {
-            if let Ok(rx) = receiver.lock() {
-                if let Ok(message) = rx.recv() {
-                    // grab the message and release the queue, so we don't block the queue.
-                    next_message = Some(message);
-                }
-            }
-
-            if let Some(msg) = next_message.take() {
-                match msg {
-                    Message::NewJob(job) => job.call_box(),
-                    Message::Terminate(id) => {
-                        if id == 0 { break; }
-                        if my_id == id { break; }
-                    }
-                }
-            }
-        }
-    }
-
     fn terminate(pool: &ThreadPool, worker: &mut Worker) {
-        pool.sender.send(Message::Terminate(worker.id)).unwrap_or_else(|err| {
-            eprintln!("Unable to send message: {}", err);
-        });
+        pool.sender
+            .send(Message::Terminate(worker.id))
+            .unwrap_or_else(|err| {
+                eprintln!("Unable to send message: {}", err);
+            });
 
         if let Some(thread) = worker.thread.take() {
-            thread.join().expect("Couldn't join on the associated thread");
+            thread
+                .join()
+                .expect("Couldn't join on the associated thread");
         }
     }
 }

@@ -1,14 +1,14 @@
 use std::mem;
 use std::thread;
 use std::thread::JoinHandle;
-use std::sync::{Once, ONCE_INIT};
+use std::sync::{Mutex, Once, ONCE_INIT};
 use super::common::{PoolManager, ThreadPool};
 
 static ONCE: Once = ONCE_INIT;
 static mut POOL: Option<Pool> = None;
 
 struct Pool {
-    store: Box<ThreadPool>,
+    store: Mutex<Box<ThreadPool>>,
 }
 
 pub fn initialize(size: usize) {
@@ -28,11 +28,17 @@ pub fn initialize(size: usize) {
     }
 }
 
-pub fn run<F>(f: F) where F: FnOnce() + Send + 'static {
+pub fn run<F>(f: F)
+where
+    F: FnOnce() + Send + 'static,
+{
     unsafe {
         if let Some(ref pool) = POOL {
             // if pool has been created
-            pool.store.execute(f);
+            if let Ok(store) = pool.store.lock() {
+                store.execute(f);
+            }
+
             return;
         }
 
@@ -43,9 +49,10 @@ pub fn run<F>(f: F) where F: FnOnce() + Send + 'static {
 
 pub fn close() {
     unsafe {
-        if let Some(mut pool) = POOL.take() {
-            pool.store.clear();
-            drop(pool);
+        if let Some(pool) = POOL.take() {
+            if let Ok(mut store) = pool.store.lock() {
+                store.clear();
+            }
         }
     }
 }
@@ -57,22 +64,27 @@ pub fn resize(size: usize) -> JoinHandle<()> {
         }
 
         unsafe {
-            if let Some(ref mut pool) = POOL {
-                pool.store.resize(size);
-            } else {
-                create(size);
+            if let Some(ref pool) = POOL {
+                if let Ok(mut store) = pool.store.lock() {
+                    store.resize(size);
+                    return;
+                }
             }
         }
+
+        create(size);
     })
 }
 
 fn create(size: usize) {
-    if size == 0 { return; }
+    if size == 0 {
+        return;
+    }
 
     unsafe {
         // Make the pool
         let pool = Some(Pool {
-            store: Box::new(ThreadPool::new(size))
+            store: Mutex::new(Box::new(ThreadPool::new(size))),
         });
 
         // Put it in the heap so it can outlive this call

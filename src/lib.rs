@@ -12,4 +12,4 @@ pub mod index_mode {
     pub use multi_pools::{close, initialize, resize_pool, run_with};
 }
 
-pub use common::{PoolState, PoolManager, ThreadPool};
+pub use common::{PoolManager, PoolState, ThreadPool};

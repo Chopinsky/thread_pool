@@ -1,15 +1,17 @@
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 use std::mem;
 use std::thread;
 use std::thread::JoinHandle;
-use std::sync::{Once, ONCE_INIT};
+use std::sync::{Mutex, Once, ONCE_INIT};
 use super::common::{PoolManager, PoolState, ThreadPool};
 
 static ONCE: Once = ONCE_INIT;
 static mut MULTI_POOL: Option<PoolStore> = None;
 
 struct PoolStore {
-    store: HashMap<String, Box<ThreadPool>>,
+    store: HashMap<String, Mutex<Box<ThreadPool>>>,
 }
 
 pub fn initialize(keys: HashMap<String, usize>) {
@@ -26,9 +28,11 @@ pub fn initialize(keys: HashMap<String, usize>) {
             let mut store = HashMap::with_capacity(keys.len());
 
             for (key, size) in keys {
-                if key.is_empty() || size == 0 { continue; }
+                if key.is_empty() || size == 0 {
+                    continue;
+                }
 
-                let work_pool = Box::new(ThreadPool::new(size));
+                let work_pool = Mutex::new(Box::new(ThreadPool::new(size)));
                 store.entry(key).or_insert(work_pool);
             }
 
@@ -41,13 +45,18 @@ pub fn initialize(keys: HashMap<String, usize>) {
     }
 }
 
-pub fn run_with<F>(pool_key: String, f: F) where F: FnOnce() + Send + 'static {
+pub fn run_with<F>(pool_key: String, f: F)
+where
+    F: FnOnce() + Send + 'static,
+{
     unsafe {
         if let Some(ref pool) = MULTI_POOL {
             // if pool has been created
             if let Some(worker_pool) = pool.store.get(&pool_key) {
-                worker_pool.execute(f);
-                return;
+                if let Ok(workers) = worker_pool.lock() {
+                    workers.execute(f);
+                    return;
+                }
             }
         }
 
@@ -59,21 +68,25 @@ pub fn run_with<F>(pool_key: String, f: F) where F: FnOnce() + Send + 'static {
 pub fn close() {
     unsafe {
         if let Some(pool) = MULTI_POOL.take() {
-            for (_, mut pool) in pool.store {
-                pool.clear();
+            for (_, pool) in pool.store {
+                if let Ok(mut workers) = pool.lock() {
+                    workers.clear();
+                }
             }
         }
     }
 }
 
 pub fn resize_pool(pool_key: String, size: usize) {
-    if pool_key.is_empty() { return; }
+    if pool_key.is_empty() {
+        return;
+    }
 
-    thread::spawn(move || {
-        unsafe {
-            if let Some(ref mut pools) = MULTI_POOL {
-                if let Some(pool) = pools.store.get_mut(&pool_key) {
-                    pool.resize(size);
+    thread::spawn(move || unsafe {
+        if let Some(ref mut pools) = MULTI_POOL {
+            if let Some(pool) = pools.store.get_mut(&pool_key) {
+                if let Ok(mut workers) = pool.lock() {
+                    workers.resize(size);
                 }
             }
         }
@@ -81,13 +94,15 @@ pub fn resize_pool(pool_key: String, size: usize) {
 }
 
 pub fn remove_pool(key: String) -> Option<JoinHandle<()>> {
-    if key.is_empty() { return None; }
+    if key.is_empty() {
+        return None;
+    }
 
-    let handler = thread::spawn(move || {
-        unsafe {
-            if let Some(ref mut pools) = MULTI_POOL {
-                if let Some(mut pool) = pools.store.remove(&key) {
-                    pool.clear();
+    let handler = thread::spawn(move || unsafe {
+        if let Some(ref mut pools) = MULTI_POOL {
+            if let Some(pool) = pools.store.remove(&key) {
+                if let Ok(mut workers) = pool.lock() {
+                    workers.clear();
                 }
             }
         }
@@ -97,24 +112,24 @@ pub fn remove_pool(key: String) -> Option<JoinHandle<()>> {
 }
 
 pub fn add_pool(key: String, size: usize) -> Option<JoinHandle<()>> {
-    if key.is_empty() || size == 0 { return None; }
+    if key.is_empty() || size == 0 {
+        return None;
+    }
 
-    let handler = thread::spawn(move || {
-       unsafe {
-           if let Some(ref mut pools) = MULTI_POOL {
-               if let Some(mut pool) = pools.store.get_mut(&key) {
-                   if pool.get_size() != size {
-                       pool.resize(size);
-                   }
+    let handler = thread::spawn(move || unsafe {
+        if let Some(ref mut pools) = MULTI_POOL {
+            if let Some(pool) = pools.store.get_mut(&key) {
+                if let Ok(mut workers) = pool.lock() {
+                    if workers.get_size() != size {
+                        workers.resize(size);
+                        return;
+                    }
+                }
+            }
 
-                   return;
-               }
-
-               let new_pool = Box::new(ThreadPool::new(size));
-               pools.store.insert(key, new_pool);
-
-           }
-       }
+            let new_pool = Mutex::new(Box::new(ThreadPool::new(size)));
+            pools.store.insert(key, new_pool);
+        }
     });
 
     Some(handler)
