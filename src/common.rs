@@ -22,7 +22,7 @@ enum Message {
 pub struct ThreadPool {
     workers: Vec<Worker>,
     last_id: usize,
-    sender: mpsc::Sender<Message>,
+    sender: Mutex<mpsc::Sender<Message>>,
     receiver: Arc<Mutex<mpsc::Receiver<Message>>>,
 }
 
@@ -49,7 +49,7 @@ impl ThreadPool {
         ThreadPool {
             workers,
             last_id: start + pool_size - 1,
-            sender,
+            sender: Mutex::new(sender),
             receiver,
         }
     }
@@ -59,11 +59,12 @@ impl ThreadPool {
         F: FnOnce() + Send + 'static,
     {
         let job = Box::new(f);
-        self.sender
-            .send(Message::NewJob(job))
-            .unwrap_or_else(|err| {
+
+        if let Ok(sender) = self.sender.lock() {
+            sender.send(Message::NewJob(job)).unwrap_or_else(|err| {
                 eprintln!("Unable to distribute the job: {}", err);
             });
+        }
     }
 }
 
@@ -140,12 +141,12 @@ impl PoolManager for ThreadPool {
     }
 
     fn clear(&mut self) {
-        for _ in &mut self.workers {
-            self.sender
-                .send(Message::Terminate(0))
-                .unwrap_or_else(|err| {
+        if let Ok(sender) = self.sender.lock() {
+            for _ in &mut self.workers {
+                sender.send(Message::Terminate(0)).unwrap_or_else(|err| {
                     eprintln!("Unable to send message: {}", err);
                 });
+            }
         }
 
         for worker in &mut self.workers {
@@ -256,11 +257,13 @@ impl Worker {
     }
 
     fn terminate(pool: &ThreadPool, worker: &mut Worker) {
-        pool.sender
-            .send(Message::Terminate(worker.id))
-            .unwrap_or_else(|err| {
-                eprintln!("Unable to send message: {}", err);
-            });
+        if let Ok(sender) = pool.sender.lock() {
+            sender
+                .send(Message::Terminate(worker.id))
+                .unwrap_or_else(|err| {
+                    eprintln!("Unable to send message: {}", err);
+                });
+        }
 
         if let Some(thread) = worker.thread.take() {
             thread
