@@ -1,14 +1,14 @@
 use std::mem;
 use std::thread;
 use std::thread::JoinHandle;
-use std::sync::{Mutex, Once, ONCE_INIT};
+use std::sync::{Once, ONCE_INIT};
 use super::common::{PoolManager, ThreadPool};
 
 static ONCE: Once = ONCE_INIT;
 static mut POOL: Option<Pool> = None;
 
 struct Pool {
-    store: Mutex<Box<ThreadPool>>,
+    store: Box<ThreadPool>,
 }
 
 pub fn initialize(size: usize) {
@@ -35,10 +35,7 @@ where
     unsafe {
         if let Some(ref pool) = POOL {
             // if pool has been created
-            if let Ok(store) = pool.store.lock() {
-                store.execute(f);
-            }
-
+            pool.store.execute(f);
             return;
         }
 
@@ -49,10 +46,8 @@ where
 
 pub fn close() {
     unsafe {
-        if let Some(pool) = POOL.take() {
-            if let Ok(mut store) = pool.store.lock() {
-                store.clear();
-            }
+        if let Some(mut pool) = POOL.take() {
+            pool.store.clear();
         }
     }
 }
@@ -64,11 +59,9 @@ pub fn resize(size: usize) -> JoinHandle<()> {
         }
 
         unsafe {
-            if let Some(ref pool) = POOL {
-                if let Ok(mut store) = pool.store.lock() {
-                    store.resize(size);
-                    return;
-                }
+            if let Some(ref mut pool) = POOL {
+                pool.store.resize(size);
+                return;
             }
         }
 
@@ -84,7 +77,7 @@ fn create(size: usize) {
     unsafe {
         // Make the pool
         let pool = Some(Pool {
-            store: Mutex::new(Box::new(ThreadPool::new(size))),
+            store: Box::new(ThreadPool::new(size)),
         });
 
         // Put it in the heap so it can outlive this call

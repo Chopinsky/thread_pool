@@ -4,14 +4,14 @@ use std::collections::HashMap;
 use std::mem;
 use std::thread;
 use std::thread::JoinHandle;
-use std::sync::{Mutex, Once, ONCE_INIT};
+use std::sync::{Once, ONCE_INIT};
 use super::common::{PoolManager, PoolState, ThreadPool};
 
 static ONCE: Once = ONCE_INIT;
 static mut MULTI_POOL: Option<PoolStore> = None;
 
 struct PoolStore {
-    store: HashMap<String, Mutex<Box<ThreadPool>>>,
+    store: HashMap<String, Box<ThreadPool>>,
 }
 
 pub fn initialize(keys: HashMap<String, usize>) {
@@ -32,7 +32,7 @@ pub fn initialize(keys: HashMap<String, usize>) {
                     continue;
                 }
 
-                let work_pool = Mutex::new(Box::new(ThreadPool::new(size)));
+                let work_pool = Box::new(ThreadPool::new(size));
                 store.entry(key).or_insert(work_pool);
             }
 
@@ -53,10 +53,8 @@ where
         if let Some(ref pool) = MULTI_POOL {
             // if pool has been created
             if let Some(worker_pool) = pool.store.get(&pool_key) {
-                if let Ok(workers) = worker_pool.lock() {
-                    workers.execute(f);
-                    return;
-                }
+                worker_pool.execute(f);
+                return;
             }
         }
 
@@ -68,10 +66,8 @@ where
 pub fn close() {
     unsafe {
         if let Some(pool) = MULTI_POOL.take() {
-            for (_, pool) in pool.store {
-                if let Ok(mut workers) = pool.lock() {
-                    workers.clear();
-                }
+            for (_, mut pool) in pool.store {
+                pool.clear();
             }
         }
     }
@@ -84,10 +80,8 @@ pub fn resize_pool(pool_key: String, size: usize) {
 
     thread::spawn(move || unsafe {
         if let Some(ref mut pools) = MULTI_POOL {
-            if let Some(pool) = pools.store.get_mut(&pool_key) {
-                if let Ok(mut workers) = pool.lock() {
-                    workers.resize(size);
-                }
+            if let Some(mut pool) = pools.store.get_mut(&pool_key) {
+                pool.resize(size);
             }
         }
     });
@@ -100,10 +94,8 @@ pub fn remove_pool(key: String) -> Option<JoinHandle<()>> {
 
     let handler = thread::spawn(move || unsafe {
         if let Some(ref mut pools) = MULTI_POOL {
-            if let Some(pool) = pools.store.remove(&key) {
-                if let Ok(mut workers) = pool.lock() {
-                    workers.clear();
-                }
+            if let Some(mut pool) = pools.store.remove(&key) {
+                pool.clear();
             }
         }
     });
@@ -118,16 +110,14 @@ pub fn add_pool(key: String, size: usize) -> Option<JoinHandle<()>> {
 
     let handler = thread::spawn(move || unsafe {
         if let Some(ref mut pools) = MULTI_POOL {
-            if let Some(pool) = pools.store.get_mut(&key) {
-                if let Ok(mut workers) = pool.lock() {
-                    if workers.get_size() != size {
-                        workers.resize(size);
-                        return;
-                    }
+            if let Some(mut pool) = pools.store.get_mut(&key) {
+                if pool.get_size() != size {
+                    pool.resize(size);
+                    return;
                 }
             }
 
-            let new_pool = Mutex::new(Box::new(ThreadPool::new(size)));
+            let new_pool = Box::new(ThreadPool::new(size));
             pools.store.insert(key, new_pool);
         }
     });
