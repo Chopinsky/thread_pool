@@ -143,17 +143,19 @@ impl PoolManager for ThreadPool {
     fn clear(&mut self) {
         if let Ok(sender) = self.sender.lock() {
             for _ in &mut self.workers {
-                sender.send(Message::Terminate(0)).unwrap_or_else(|err| {
-                    eprintln!("Unable to send message: {}", err);
-                });
+                sender
+                    .send(Message::Terminate(0))
+                    .unwrap_or_else(|err| {
+                        eprintln!("Unable to send message: {}", err);
+                    });
             }
         }
 
         for worker in &mut self.workers {
             if let Some(thread) = worker.thread.take() {
-                thread
-                    .join()
-                    .expect("Couldn't join on the associated thread");
+                thread.join().unwrap_or_else(|e| {
+                    eprintln!("Unable to join the thread: {:?}", e);
+                });
             }
         }
     }
