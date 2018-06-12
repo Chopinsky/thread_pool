@@ -1,6 +1,7 @@
 use std::thread;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex};
 use debug::is_debug_mode;
+use crossbeam_channel as channel;
 
 type Job = Box<FnBox + Send + 'static>;
 
@@ -22,8 +23,8 @@ enum Message {
 pub struct ThreadPool {
     workers: Vec<Worker>,
     last_id: usize,
-    sender: Mutex<mpsc::Sender<Message>>,
-    receiver: Arc<Mutex<mpsc::Receiver<Message>>>,
+    sender: Mutex<channel::Sender<Message>>,
+    receiver: Arc<Mutex<channel::Receiver<Message>>>,
 }
 
 impl ThreadPool {
@@ -33,7 +34,7 @@ impl ThreadPool {
             _ => size,
         };
 
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = channel::unbounded();
         let receiver = Arc::new(Mutex::new(receiver));
         let start = 1;
 
@@ -58,12 +59,10 @@ impl ThreadPool {
     where
         F: FnOnce() + Send + 'static,
     {
-        let job = Box::new(f);
-
         if let Ok(sender) = self.sender.lock() {
-            sender.send(Message::NewJob(job)).unwrap_or_else(|err| {
-                eprintln!("Unable to distribute the job: {}", err);
-            });
+            sender.send(Message::NewJob(Box::new(f)));
+        } else if is_debug_mode() {
+            eprintln!("Unable to execute the job: the sender seems to have been closed.");
         }
     }
 }
@@ -143,11 +142,7 @@ impl PoolManager for ThreadPool {
     fn clear(&mut self) {
         if let Ok(sender) = self.sender.lock() {
             for _ in &mut self.workers {
-                sender
-                    .send(Message::Terminate(0))
-                    .unwrap_or_else(|err| {
-                        eprintln!("Unable to send message: {}", err);
-                    });
+                sender.send(Message::Terminate(0));
             }
         }
 
@@ -225,14 +220,18 @@ struct Worker {
 }
 
 impl Worker {
-    fn new(my_id: usize, receiver: Arc<Mutex<mpsc::Receiver<Message>>>) -> Worker {
+    fn new(my_id: usize, receiver: Arc<Mutex<channel::Receiver<Message>>>) -> Worker {
         let thread = thread::spawn(move || {
             let mut new_assignment = None;
 
             loop {
                 if let Ok(rx) = receiver.lock() {
-                    if let Ok(message) = rx.recv() {
+                    if let Some(message) = rx.recv() {
+                        // receiving a new message
                         new_assignment = Some(message);
+                    } else {
+                        // sender has been dropped
+                        break;
                     }
                 }
 
@@ -260,11 +259,7 @@ impl Worker {
 
     fn terminate(pool: &ThreadPool, worker: &mut Worker) {
         if let Ok(sender) = pool.sender.lock() {
-            sender
-                .send(Message::Terminate(worker.id))
-                .unwrap_or_else(|err| {
-                    eprintln!("Unable to send message: {}", err);
-                });
+            sender.send(Message::Terminate(worker.id));
         }
 
         if let Some(thread) = worker.thread.take() {

@@ -1,3 +1,5 @@
+extern crate crossbeam_channel;
+
 mod single_pool;
 mod multi_pools;
 mod debug;
