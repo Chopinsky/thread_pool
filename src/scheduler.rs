@@ -4,6 +4,7 @@ use debug::is_debug_mode;
 use crossbeam_channel as channel;
 
 type Job = Box<FnBox + Send + 'static>;
+static THRESHOLD: usize = 100000;
 
 trait FnBox {
     fn call_box(self: Box<Self>);
@@ -25,12 +26,15 @@ pub struct ThreadPool {
     last_id: usize,
     sender: Mutex<channel::Sender<Message>>,
     receiver: Arc<Mutex<channel::Receiver<Message>>>,
+    auto_extend_threshold: usize,
+    init_size: usize
 }
 
 impl ThreadPool {
     pub fn new(size: usize) -> ThreadPool {
         let pool_size = match size {
             _ if size < 1 => 1,
+            _ if size > THRESHOLD => THRESHOLD,
             _ => size,
         };
 
@@ -52,6 +56,8 @@ impl ThreadPool {
             last_id: start + pool_size - 1,
             sender: Mutex::new(sender),
             receiver,
+            auto_extend_threshold: THRESHOLD,
+            init_size: pool_size,
         }
     }
 
@@ -65,12 +71,14 @@ impl ThreadPool {
             eprintln!("Unable to execute the job: the sender seems to have been closed.");
         }
     }
+
+    //TODO: add execute_flexible to extend the worker queue when full or above threshold
 }
 
 pub trait PoolManager {
     fn extend(&mut self, more: usize);
     fn shrink(&mut self, less: usize);
-    fn resize(&mut self, size: usize);
+    fn resize(&mut self, total: usize);
     fn kill_worker(&mut self, id: usize);
     fn clear(&mut self);
 }
@@ -111,15 +119,15 @@ impl PoolManager for ThreadPool {
         }
     }
 
-    fn resize(&mut self, size: usize) {
+    fn resize(&mut self, total: usize) {
         let len = self.workers.len();
 
-        if size == len {
+        if total == len {
             return;
-        } else if size > len {
-            self.extend(size - len);
+        } else if total > len {
+            self.extend(total - len);
         } else {
-            self.shrink(len - size);
+            self.shrink(len - total);
         }
     }
 
@@ -158,6 +166,9 @@ impl PoolManager for ThreadPool {
 
 pub trait PoolState {
     fn get_size(&self) -> usize;
+    fn get_queue_length(&self) -> Result<usize, &'static str>;
+    fn get_queue_size_threshold(&self) -> usize;
+    fn set_queue_size_threshold(&mut self, threshold: usize);
     fn get_first_worker_id(&self) -> Option<usize>;
     fn get_last_worker_id(&self) -> Option<usize>;
     fn get_next_worker_id(&self, id: usize) -> Option<usize>;
@@ -167,6 +178,32 @@ impl PoolState for ThreadPool {
     #[inline]
     fn get_size(&self) -> usize {
         self.workers.len()
+    }
+
+    fn get_queue_length(&self) -> Result<usize, &'static str> {
+        match self.sender.lock() {
+            Ok(sender) => Ok(sender.len()),
+            Err(_) => Err("Unable to obtain message queue size."),
+        }
+    }
+
+    #[inline]
+    fn get_queue_size_threshold(&self) -> usize {
+        self.auto_extend_threshold
+    }
+
+    fn set_queue_size_threshold(&mut self, threshold: usize) {
+        if threshold > THRESHOLD {
+            eprintln!(
+                "WARNING: You're trying to set the queue size larger than the soft maximum threshold of 100000, this could cause drop of performance");
+        }
+
+        self.auto_extend_threshold =
+            if threshold > self.init_size {
+                threshold
+            } else {
+                self.init_size
+            };
     }
 
     fn get_first_worker_id(&self) -> Option<usize> {

@@ -2,7 +2,7 @@ use std::mem;
 use std::thread;
 use std::thread::JoinHandle;
 use std::sync::{Once, ONCE_INIT};
-use super::common::{PoolManager, ThreadPool};
+use super::scheduler::{PoolManager, ThreadPool};
 
 static ONCE: Once = ONCE_INIT;
 static mut POOL: Option<Pool> = None;

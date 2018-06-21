@@ -5,7 +5,7 @@ use std::mem;
 use std::thread;
 use std::thread::JoinHandle;
 use std::sync::{Once, ONCE_INIT};
-use super::common::{PoolManager, PoolState, ThreadPool};
+use super::scheduler::{PoolManager, PoolState, ThreadPool};
 
 static ONCE: Once = ONCE_INIT;
 static mut MULTI_POOL: Option<PoolStore> = None;
