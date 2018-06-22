@@ -4,7 +4,9 @@ use debug::is_debug_mode;
 use crossbeam_channel as channel;
 
 type Job = Box<FnBox + Send + 'static>;
+
 static THRESHOLD: usize = 100000;
+static AUTO_EXTEND_TRIGGER_SIZE: usize = 2;
 
 trait FnBox {
     fn call_box(self: Box<Self>);
@@ -61,10 +63,7 @@ impl ThreadPool {
         }
     }
 
-    pub fn execute<F>(&self, f: F)
-    where
-        F: FnOnce() + Send + 'static,
-    {
+    pub fn execute<F: FnOnce() + Send + 'static>(&self, f: F) {
         if let Ok(sender) = self.sender.lock() {
             sender.send(Message::NewJob(Box::new(f)));
         } else if is_debug_mode() {
@@ -72,13 +71,31 @@ impl ThreadPool {
         }
     }
 
-    //TODO: add execute_flexible to extend the worker queue when full or above threshold
+    pub fn execute_automode<F: FnOnce() + Send + 'static>(&mut self, f: F) {
+        let adjustment = if let Ok(sender) = self.sender.lock() {
+            let adjustment_private = get_adjustment_target(&self, &sender);
+            sender.send(Message::NewJob(Box::new(f)));
+
+            adjustment_private
+        } else {
+            if is_debug_mode() {
+                eprintln!("Unable to execute the job: the sender seems to have been closed.");
+            }
+
+            None
+        };
+
+        if let Some(change) = adjustment {
+            self.resize(change)
+        }
+    }
 }
 
 pub trait PoolManager {
     fn extend(&mut self, more: usize);
     fn shrink(&mut self, less: usize);
     fn resize(&mut self, total: usize);
+    fn auto_adjust(&mut self);
     fn kill_worker(&mut self, id: usize);
     fn clear(&mut self);
 }
@@ -120,14 +137,30 @@ impl PoolManager for ThreadPool {
     }
 
     fn resize(&mut self, total: usize) {
-        let len = self.workers.len();
-
-        if total == len {
+        if total == 0 {
             return;
-        } else if total > len {
-            self.extend(total - len);
+        }
+
+        let worker_count = self.workers.len();
+        if total == worker_count {
+            return;
+        } else if total > worker_count {
+            self.extend(total - worker_count);
         } else {
-            self.shrink(len - total);
+            self.shrink(worker_count - total);
+        }
+    }
+
+    fn auto_adjust(&mut self) {
+        let adjustment =
+            if let Ok(sender) = self.sender.lock() {
+                get_adjustment_target(&self, &sender)
+            } else {
+                None
+            };
+
+        if let Some(change) = adjustment {
+            self.resize(change);
         }
     }
 
@@ -302,7 +335,24 @@ impl Worker {
         if let Some(thread) = worker.thread.take() {
             thread
                 .join()
-                .expect("Couldn't join on the associated thread");
+                .unwrap_or_else(|e| {
+                    eprintln!("Failed to join the associated thread: {:?}", e);
+                });
         }
+    }
+}
+
+fn get_adjustment_target(pool: &ThreadPool, sender: &channel::Sender<Message>) -> Option<usize> {
+    let worker_count = pool.workers.len();
+    let queue_length = sender.len();
+
+    if queue_length > AUTO_EXTEND_TRIGGER_SIZE && worker_count <= pool.auto_extend_threshold {
+        // The workers size may be larger than the threshold, but that's okay since we won't
+        // add more workers from this point on, unless some workers are killed.
+        Some(worker_count + queue_length)
+    } else if queue_length == 0 && worker_count > pool.init_size {
+        Some(((worker_count + pool.init_size) / 2) as usize)
+    } else {
+        None
     }
 }
