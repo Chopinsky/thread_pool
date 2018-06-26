@@ -12,9 +12,11 @@ static mut POOL: Option<Pool> = None;
 
 struct Pool {
     store: Box<ThreadPool>,
+    auto_mode: bool,
     auto_adjust_handler: Option<JoinHandle<()>>,
 }
 
+#[inline]
 pub fn initialize(size: usize) {
     initialize_with_auto_adjustment(size, None);
 }
@@ -29,26 +31,32 @@ pub fn initialize_with_auto_adjustment(size: usize, period: Option<Duration>) {
         if POOL.is_some() {
             panic!("You are trying to initialize the thread pools multiple times!");
         }
-
-        ONCE.call_once(|| {
-            create(pool_size, period);
-        });
     }
+
+    ONCE.call_once(|| {
+        create(pool_size, period);
+    });
 }
 
-pub fn run<F>(f: F)
-where
-    F: FnOnce() + Send + 'static,
-{
+pub fn run<F: FnOnce() + Send + 'static>(f: F) {
     unsafe {
-        if let Some(ref pool) = POOL {
-            // if pool has been created
-            pool.store.execute(f);
+        if let Some(ref mut pool) = POOL {
+            // if pool has been created, execute in proper mode.
+            match &pool.auto_mode {
+                &true => pool.store.execute_automode(f),
+                &false => pool.store.execute(f),
+            }
+
             return;
         }
 
         // otherwise, spawn to a new thread for the work;
         thread::spawn(f);
+
+        // meanwhile, lazy initialize (again?) the pool
+        if POOL.is_none() {
+            initialize(1);
+        }
     }
 }
 
@@ -77,39 +85,31 @@ pub fn resize(size: usize) -> JoinHandle<()> {
     })
 }
 
-fn create(size: usize, auto_adjustment: Option<Duration>) {
-    if size == 0 {
-        return;
-    }
-
-    let handler = if let Some(period) = auto_adjustment {
-        Some(start_auto_adjustment(period))
-    } else {
-        None
-    };
-
+pub fn update_auto_adjustment_mode(enable: bool) {
     unsafe {
-        // Make the pool
-        let pool = Some(Pool {
-            store: Box::new(ThreadPool::new(size)),
-            auto_adjust_handler: handler,
-        });
+        if let Some(ref mut pool) = POOL {
+            if pool.auto_mode == enable {
+                return;
+            }
 
-        // Put it in the heap so it can outlive this call
-        POOL = mem::transmute(pool);
+            if !enable && pool.auto_adjust_handler.is_some() {
+                stop_auto_adjustment(pool);
+            }
+
+            pool.auto_mode = enable;
+        }
     }
 }
 
-pub fn update_auto_adjustment(period: Option<Duration>) {
+pub fn update_auto_adjustment_period(period: Option<Duration>) {
     unsafe {
         if let Some(ref mut pool) = POOL {
-            if let Some(mut handler) = pool.auto_adjust_handler.take() {
-                handler.join().unwrap_or_else(|e| {
-                    eprintln!("Unable to join the thread: {:?}", e);
-                });
-            }
+            // stop the previous auto job regardless
+            stop_auto_adjustment(pool);
 
+            // initiate the new auto adjustment job if configured
             if let Some(actual_period) = period {
+                pool.auto_mode = true;
                 pool.auto_adjust_handler = Some(start_auto_adjustment(actual_period));
             }
         }
@@ -120,6 +120,18 @@ fn trigger_auto_adjustment() {
     unsafe {
         if let Some(ref mut pool) = POOL {
             pool.store.auto_adjust();
+        }
+    }
+}
+
+fn stop_auto_adjustment(pool: &mut Pool) {
+    if let Some(handler) = pool.auto_adjust_handler.take() {
+        handler.join().unwrap_or_else(|e| {
+            eprintln!("Unable to join the thread: {:?}", e);
+        });
+
+        if pool.auto_mode {
+            pool.auto_mode = false;
         }
     }
 }
@@ -140,4 +152,29 @@ fn start_auto_adjustment(period: Duration) -> JoinHandle<()> {
             thread::sleep(actual_period);
         }
     })
+}
+
+fn create(size: usize, auto_adjustment: Option<Duration>) {
+    if size == 0 {
+        return;
+    }
+
+    let (auto_mode, handler) =
+        if let Some(period) = auto_adjustment {
+            (true, Some(start_auto_adjustment(period)))
+        } else {
+            (false, None)
+        };
+
+    unsafe {
+        // Make the pool
+        let pool = Some(Pool {
+            store: Box::new(ThreadPool::new(size)),
+            auto_mode,
+            auto_adjust_handler: handler,
+        });
+
+        // Put it in the heap so it can outlive this call
+        POOL = mem::transmute(pool);
+    }
 }

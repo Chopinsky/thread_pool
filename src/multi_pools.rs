@@ -4,7 +4,8 @@ use std::collections::HashMap;
 use std::mem;
 use std::thread;
 use std::thread::JoinHandle;
-use std::sync::{Once, ONCE_INIT};
+use std::time::Duration;
+use std::sync::{Once, ONCE_INIT, Arc, RwLock};
 use super::scheduler::{PoolManager, PoolState, ThreadPool};
 
 static ONCE: Once = ONCE_INIT;
@@ -12,9 +13,16 @@ static mut MULTI_POOL: Option<PoolStore> = None;
 
 struct PoolStore {
     store: HashMap<String, Box<ThreadPool>>,
+    auto_adjust_handler: Option<JoinHandle<()>>,
+    auto_adjust_register: Arc<RwLock<Vec<String>>>,
 }
 
+#[inline]
 pub fn initialize(keys: HashMap<String, usize>) {
+    initialize_with_auto_adjustment(keys, None);
+}
+
+pub fn initialize_with_auto_adjustment(keys: HashMap<String, usize>, period: Option<Duration>) {
     if keys.is_empty() {
         return;
     }
@@ -23,26 +31,11 @@ pub fn initialize(keys: HashMap<String, usize>) {
         if MULTI_POOL.is_some() {
             panic!("You are trying to initialize the thread pools multiple times!");
         }
-
-        ONCE.call_once(|| {
-            let mut store = HashMap::with_capacity(keys.len());
-
-            for (key, size) in keys {
-                if key.is_empty() || size == 0 {
-                    continue;
-                }
-
-                let work_pool = Box::new(ThreadPool::new(size));
-                store.entry(key).or_insert(work_pool);
-            }
-
-            // Make the pool
-            let pool = Some(PoolStore { store });
-
-            // Put it in the heap so it can outlive this call
-            MULTI_POOL = mem::transmute(pool);
-        });
     }
+
+    ONCE.call_once(|| {
+        create(keys, period);
+    });
 }
 
 pub fn run_with<F>(pool_key: String, f: F)
@@ -123,4 +116,29 @@ pub fn add_pool(key: String, size: usize) -> Option<JoinHandle<()>> {
     });
 
     Some(handler)
+}
+
+fn create(keys: HashMap<String, usize>, period: Option<Duration>) {
+    let mut store = HashMap::with_capacity(keys.len());
+
+    for (key, size) in keys {
+        if key.is_empty() || size == 0 {
+            continue;
+        }
+
+        let work_pool = Box::new(ThreadPool::new(size));
+        store.entry(key).or_insert(work_pool);
+    }
+
+    // Make the pool
+    let pool = Some(PoolStore {
+        store,
+        auto_adjust_handler: None,
+        auto_adjust_register: Arc::new(RwLock::new(Vec::new())),
+    });
+
+    unsafe {
+        // Put it in the heap so it can outlive this call
+        MULTI_POOL = mem::transmute(pool);
+    }
 }
