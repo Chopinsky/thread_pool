@@ -351,7 +351,11 @@ fn get_adjustment_target(pool: &ThreadPool, sender: &channel::Sender<Message>) -
         // add more workers from this point on, unless some workers are killed.
         Some(worker_count + queue_length)
     } else if queue_length == 0 && worker_count > pool.init_size {
-        Some(((worker_count + pool.init_size) / 2) as usize)
+        if worker_count == (pool.init_size + 1) {
+            Some(pool.init_size)
+        } else {
+            Some(((worker_count + pool.init_size) / 2) as usize)
+        }
     } else {
         None
     }

@@ -101,7 +101,7 @@ pub fn update_auto_adjustment_mode(enable: bool) {
     }
 }
 
-pub fn update_auto_adjustment_period(period: Option<Duration>) {
+pub fn reset_auto_adjustment_period(period: Option<Duration>) {
     unsafe {
         if let Some(ref mut pool) = POOL {
             // stop the previous auto job regardless
@@ -124,18 +124,6 @@ fn trigger_auto_adjustment() {
     }
 }
 
-fn stop_auto_adjustment(pool: &mut Pool) {
-    if let Some(handler) = pool.auto_adjust_handler.take() {
-        handler.join().unwrap_or_else(|e| {
-            eprintln!("Unable to join the thread: {:?}", e);
-        });
-
-        if pool.auto_mode {
-            pool.auto_mode = false;
-        }
-    }
-}
-
 fn start_auto_adjustment(period: Duration) -> JoinHandle<()> {
     let one_second = Duration::from_secs(1);
     let actual_period = if period < one_second {
@@ -152,6 +140,18 @@ fn start_auto_adjustment(period: Duration) -> JoinHandle<()> {
             thread::sleep(actual_period);
         }
     })
+}
+
+fn stop_auto_adjustment(pool: &mut Pool) {
+    if let Some(handler) = pool.auto_adjust_handler.take() {
+        handler.join().unwrap_or_else(|e| {
+            eprintln!("Unable to join the thread: {:?}", e);
+        });
+
+        if pool.auto_mode {
+            pool.auto_mode = false;
+        }
+    }
 }
 
 fn create(size: usize, auto_adjustment: Option<Duration>) {
