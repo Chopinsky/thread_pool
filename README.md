@@ -55,8 +55,9 @@ fn main() {
         });
     }
 
-    // The static pool must be closed, or unfinished threads will be destroyed prematurely and could cause panic.
-    // this is different from the managed pool where it can be notified to shutdown automatically when out of the scope.
+    // The static pool must be closed, or unfinished threads will be destroyed prematurely and could cause panic in the
+    // running threads. this is different from the managed pool where it can know when to shutdown as the allocated pool
+    // object goes out of the scope.
     shared_mode::close();
 }
 ```
