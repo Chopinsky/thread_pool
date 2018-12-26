@@ -1,8 +1,8 @@
 extern crate crossbeam_channel;
 
-mod single_pool;
-mod multi_pools;
 mod debug;
+mod multi_pools;
+mod single_pool;
 
 pub mod scheduler;
 

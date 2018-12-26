@@ -1,11 +1,11 @@
 #![allow(dead_code)]
 
+use super::scheduler::{PoolManager, ThreadPool};
 use std::mem;
+use std::sync::{Once, ONCE_INIT};
 use std::thread;
 use std::thread::JoinHandle;
-use std::sync::{Once, ONCE_INIT};
 use std::time::Duration;
-use super::scheduler::{PoolManager, ThreadPool};
 
 static ONCE: Once = ONCE_INIT;
 static mut POOL: Option<Pool> = None;
@@ -159,12 +159,11 @@ fn create(size: usize, auto_adjustment: Option<Duration>) {
         return;
     }
 
-    let (auto_mode, handler) =
-        if let Some(period) = auto_adjustment {
-            (true, Some(start_auto_adjustment(period)))
-        } else {
-            (false, None)
-        };
+    let (auto_mode, handler) = if let Some(period) = auto_adjustment {
+        (true, Some(start_auto_adjustment(period)))
+    } else {
+        (false, None)
+    };
 
     unsafe {
         // Make the pool

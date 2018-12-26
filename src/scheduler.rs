@@ -1,7 +1,8 @@
-use std::thread;
-use std::sync::{Arc, Mutex};
-use debug::is_debug_mode;
 use crossbeam_channel as channel;
+use debug::is_debug_mode;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use std::thread;
 
 type Job = Box<FnBox + Send + 'static>;
 
@@ -29,7 +30,7 @@ pub struct ThreadPool {
     sender: Mutex<channel::Sender<Message>>,
     receiver: Arc<Mutex<channel::Receiver<Message>>>,
     auto_extend_threshold: usize,
-    init_size: usize
+    init_size: usize,
 }
 
 impl ThreadPool {
@@ -127,11 +128,11 @@ impl PoolManager for ThreadPool {
             if self.workers.len() == 0 {
                 break;
             } else {
-                count -= 1;
-            }
+                if let Some(mut worker) = self.workers.pop() {
+                    Worker::terminate(&self, &mut worker);
+                }
 
-            if let Some(mut worker) = self.workers.pop() {
-                Worker::terminate(&self, &mut worker);
+                count -= 1;
             }
         }
     }
@@ -231,12 +232,11 @@ impl PoolState for ThreadPool {
                 "WARNING: You're trying to set the queue size larger than the soft maximum threshold of 100000, this could cause drop of performance");
         }
 
-        self.auto_extend_threshold =
-            if threshold > self.init_size {
-                threshold
-            } else {
-                self.init_size
-            };
+        self.auto_extend_threshold = if threshold > self.init_size {
+            threshold
+        } else {
+            self.init_size
+        };
     }
 
     fn get_first_worker_id(&self) -> Option<usize> {
@@ -286,6 +286,7 @@ impl Drop for ThreadPool {
 
 struct Worker {
     id: usize,
+    life: Option<Duration>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -323,6 +324,7 @@ impl Worker {
 
         Worker {
             id: my_id,
+            life: None,
             thread: Some(thread),
         }
     }
@@ -333,11 +335,9 @@ impl Worker {
         }
 
         if let Some(thread) = worker.thread.take() {
-            thread
-                .join()
-                .unwrap_or_else(|e| {
-                    eprintln!("Failed to join the associated thread: {:?}", e);
-                });
+            thread.join().unwrap_or_else(|e| {
+                eprintln!("Failed to join the associated thread: {:?}", e);
+            });
         }
     }
 }

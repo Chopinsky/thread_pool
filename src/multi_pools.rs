@@ -1,12 +1,12 @@
 #![allow(dead_code)]
 
+use super::scheduler::{PoolManager, PoolState, ThreadPool};
 use std::collections::{HashMap, HashSet};
 use std::mem;
+use std::sync::{Once, ONCE_INIT};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
-use std::sync::{Once, ONCE_INIT};
-use super::scheduler::{PoolManager, PoolState, ThreadPool};
 
 static ONCE: Once = ONCE_INIT;
 static mut MULTI_POOL: Option<PoolStore> = None;
@@ -125,7 +125,7 @@ pub fn add_pool(key: String, size: usize) -> Option<JoinHandle<()>> {
             }
 
             let new_pool = Box::new(ThreadPool::new(size));
-            pools.store.insert(key, PoolInfo { pool: new_pool, });
+            pools.store.insert(key, PoolInfo { pool: new_pool });
         }
     });
 
@@ -142,7 +142,7 @@ fn create(keys: HashMap<String, usize>, period: Option<Duration>) {
         }
 
         let new_pool = Box::new(ThreadPool::new(size));
-        store.entry(key).or_insert(PoolInfo { pool: new_pool, });
+        store.entry(key).or_insert(PoolInfo { pool: new_pool });
     }
 
     // Make the pool
@@ -238,13 +238,13 @@ pub fn toggle_pool_auto_mode(key: String, auto_adjust: bool) {
                             start_auto_adjustment(Duration::from_secs(10));
                         }
                     }
-                },
+                }
                 false => {
                     pool.auto_adjust_register.remove(&key);
                     if pool.auto_adjust_register.is_empty() {
                         stop_auto_adjustment();
                     }
-                },
+                }
             };
         }
     }
