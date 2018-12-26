@@ -1,9 +1,9 @@
-use crossbeam_channel as channel;
 use crate::debug::is_debug_mode;
+use crossbeam_channel as channel;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
 use std::thread;
+use std::time::SystemTime;
 
 type Job = Box<FnBox + Send + 'static>;
 
@@ -22,7 +22,6 @@ impl<F: FnOnce()> FnBox for F {
 
 enum Message {
     NewJob(Job),
-    Query(String),
     Terminate(usize),
 }
 
@@ -177,12 +176,11 @@ impl PoolManager for ThreadPool {
     }
 
     fn auto_adjust(&mut self) {
-        let adjustment =
-            if let Ok(sender) = self.sender.lock() {
-                get_adjustment_target(&self, &sender)
-            } else {
-                None
-            };
+        let adjustment = if let Ok(sender) = self.sender.lock() {
+            get_adjustment_target(&self, &sender)
+        } else {
+            None
+        };
 
         if let Some(change) = adjustment {
             self.resize(change);
@@ -324,12 +322,11 @@ impl Worker {
             let mut assignment = None;
             let mut done = false;
 
-            let mut since =
-                if is_privilege {
-                    None
-                } else {
-                    Some(SystemTime::now())
-                };
+            let mut since = if is_privilege {
+                None
+            } else {
+                Some(SystemTime::now())
+            };
 
             loop {
                 if let Ok(rx) = receiver.lock() {
@@ -355,10 +352,7 @@ impl Worker {
                             if since.is_some() {
                                 since = Some(SystemTime::now());
                             }
-                        },
-                        Message::Query(command) => {
-                            println!("{}", command);
-                        },
+                        }
                         Message::Terminate(job_id) => {
                             if job_id == 0 {
                                 return;
