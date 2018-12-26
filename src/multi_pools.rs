@@ -87,7 +87,7 @@ pub fn resize_pool(pool_key: String, size: usize) {
 
     thread::spawn(move || unsafe {
         if let Some(ref mut pools) = MULTI_POOL {
-            if let Some(mut pool_info) = pools.store.get_mut(&pool_key) {
+            if let Some(pool_info) = pools.store.get_mut(&pool_key) {
                 pool_info.pool.resize(size);
             }
         }
@@ -117,7 +117,7 @@ pub fn add_pool(key: String, size: usize) -> Option<JoinHandle<()>> {
 
     let handler = thread::spawn(move || unsafe {
         if let Some(ref mut pools) = MULTI_POOL {
-            if let Some(mut pool_info) = pools.store.get_mut(&key) {
+            if let Some(pool_info) = pools.store.get_mut(&key) {
                 if pool_info.pool.get_size() != size {
                     pool_info.pool.resize(size);
                     return;
@@ -268,7 +268,7 @@ fn trigger_auto_adjustment() {
             }
 
             for key in pools.auto_adjust_register.iter() {
-                if let Some(mut pool_info) = pools.store.get_mut(key) {
+                if let Some(pool_info) = pools.store.get_mut(key) {
                     pool_info.pool.auto_adjust();
                 }
             }

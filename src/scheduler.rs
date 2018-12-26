@@ -1,7 +1,8 @@
 use crossbeam_channel as channel;
-use debug::is_debug_mode;
+use crate::debug::is_debug_mode;
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use std::thread;
 
 type Job = Box<FnBox + Send + 'static>;
@@ -21,14 +22,20 @@ impl<F: FnOnce()> FnBox for F {
 
 enum Message {
     NewJob(Job),
+    Query(String),
     Terminate(usize),
+}
+
+struct Dispatcher {
+    receiver: channel::Receiver<Message>,
+    subscribers: HashSet<usize>,
 }
 
 pub struct ThreadPool {
     workers: Vec<Worker>,
     last_id: usize,
     sender: Mutex<channel::Sender<Message>>,
-    receiver: Arc<Mutex<channel::Receiver<Message>>>,
+    receiver: Arc<Mutex<Dispatcher>>,
     auto_extend_threshold: usize,
     init_size: usize,
 }
@@ -42,12 +49,24 @@ impl ThreadPool {
         };
 
         let (sender, receiver) = channel::unbounded();
-        let receiver = Arc::new(Mutex::new(receiver));
+        let receiver = Arc::new(Mutex::new(Dispatcher {
+            receiver,
+            subscribers: HashSet::new(),
+        }));
+
         let start = 1;
 
         let mut workers = Vec::with_capacity(pool_size);
+        let mut worker_ids: HashSet<usize> = HashSet::with_capacity(pool_size);
+
         for id in 0..pool_size {
-            workers.push(Worker::new(start + id, Arc::clone(&receiver)));
+            let worker_id = start + id;
+            worker_ids.insert(worker_id);
+            workers.push(Worker::new(worker_id, Arc::clone(&receiver), true));
+        }
+
+        if let Ok(mut recv_inner) = receiver.lock() {
+            recv_inner.subscribers = worker_ids;
         }
 
         if is_debug_mode() {
@@ -97,6 +116,7 @@ pub trait PoolManager {
     fn shrink(&mut self, less: usize);
     fn resize(&mut self, total: usize);
     fn auto_adjust(&mut self);
+    fn auto_expire(&mut self);
     fn kill_worker(&mut self, id: usize);
     fn clear(&mut self);
 }
@@ -111,9 +131,11 @@ impl PoolManager for ThreadPool {
         let start = self.last_id + 1;
 
         for id in 0..more {
-            let worker = Worker::new(start + id, Arc::clone(&self.receiver));
+            let worker = Worker::new(start + id, Arc::clone(&self.receiver), false);
             self.workers.push(worker);
         }
+
+        //TODO: update subscribers
 
         self.last_id += more;
     }
@@ -129,12 +151,14 @@ impl PoolManager for ThreadPool {
                 break;
             } else {
                 if let Some(mut worker) = self.workers.pop() {
-                    Worker::terminate(&self, &mut worker);
+                    worker.terminate();
                 }
 
                 count -= 1;
             }
         }
+
+        //TODO: update subscribers
     }
 
     fn resize(&mut self, total: usize) {
@@ -165,6 +189,11 @@ impl PoolManager for ThreadPool {
         }
     }
 
+    // Let extended workers to expire when idling for too long.
+    fn auto_expire(&mut self) {
+        // send query messages
+    }
+
     fn kill_worker(&mut self, id: usize) {
         let mut index = 0;
 
@@ -172,7 +201,7 @@ impl PoolManager for ThreadPool {
             if self.workers[index].id == id {
                 // swap out the worker, use swap_remove for better performance.
                 let mut worker = self.workers.swap_remove(index);
-                Worker::terminate(&self, &mut worker);
+                worker.terminate();
 
                 return;
             }
@@ -286,35 +315,56 @@ impl Drop for ThreadPool {
 
 struct Worker {
     id: usize,
-    life: Option<Duration>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
 impl Worker {
-    fn new(my_id: usize, receiver: Arc<Mutex<channel::Receiver<Message>>>) -> Worker {
+    fn new(my_id: usize, receiver: Arc<Mutex<Dispatcher>>, is_privilege: bool) -> Worker {
         let thread = thread::spawn(move || {
-            let mut new_assignment = None;
+            let mut assignment = None;
+            let mut done = false;
+
+            let mut since =
+                if is_privilege {
+                    None
+                } else {
+                    Some(SystemTime::now())
+                };
 
             loop {
                 if let Ok(rx) = receiver.lock() {
-                    if let Some(message) = rx.recv() {
+                    if let Some(message) = rx.receiver.recv() {
                         // receiving a new message
-                        new_assignment = Some(message);
+                        assignment = Some(message);
+                        done = rx.subscribers.contains(&my_id);
                     } else {
                         // sender has been dropped
-                        break;
+                        return;
                     }
                 }
 
-                if let Some(message) = new_assignment.take() {
+                if let Some(message) = assignment.take() {
                     match message {
-                        Message::NewJob(job) => job.call_box(),
+                        Message::NewJob(job) => {
+                            job.call_box();
+
+                            if done {
+                                return;
+                            }
+
+                            if since.is_some() {
+                                since = Some(SystemTime::now());
+                            }
+                        },
+                        Message::Query(command) => {
+                            println!("{}", command);
+                        },
                         Message::Terminate(job_id) => {
                             if job_id == 0 {
-                                break;
+                                return;
                             }
                             if job_id == my_id {
-                                break;
+                                return;
                             }
                         }
                     }
@@ -324,19 +374,17 @@ impl Worker {
 
         Worker {
             id: my_id,
-            life: None,
             thread: Some(thread),
         }
     }
 
-    fn terminate(pool: &ThreadPool, worker: &mut Worker) {
-        if let Ok(sender) = pool.sender.lock() {
-            sender.send(Message::Terminate(worker.id));
-        }
-
-        if let Some(thread) = worker.thread.take() {
-            thread.join().unwrap_or_else(|e| {
-                eprintln!("Failed to join the associated thread: {:?}", e);
+    fn terminate(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            // >_> kill the thread in another thread is less ideal, but we're not blocking!
+            thread::spawn(move || {
+                thread.join().unwrap_or_else(|e| {
+                    eprintln!("Failed to join the associated thread: {:?}", e);
+                });
             });
         }
     }
