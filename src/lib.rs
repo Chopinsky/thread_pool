@@ -1,10 +1,7 @@
-extern crate crossbeam_channel;
-
 mod debug;
 mod multi_pools;
 mod single_pool;
-
-pub mod scheduler;
+mod scheduler;
 
 pub mod shared_mode {
     pub use crate::single_pool::{close, initialize, resize, run};

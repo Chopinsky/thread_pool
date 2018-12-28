@@ -91,21 +91,38 @@ impl ThreadPool {
     }
 
     pub fn execute_automode<F: FnOnce() + Send + 'static>(&mut self, f: F) {
-        let adjustment = if let Ok(sender) = self.sender.lock() {
-            let adjustment_private = get_adjustment_target(&self, &sender);
-            sender.send(Message::NewJob(Box::new(f)));
+        let adjustment =
+            if let Ok(sender) = self.sender.lock() {
+                sender.send(Message::NewJob(Box::new(f)));
+                sender.len()
+            } else {
+                0
+            };
 
-            adjustment_private
-        } else {
-            if is_debug_mode() {
-                eprintln!("Unable to execute the job: the sender seems to have been closed.");
+        if let Some(change) = self.get_adjustment_target(adjustment) {
+            self.resize(change);
+        }
+    }
+
+
+    fn get_adjustment_target(&self, queue_length: usize) -> Option<usize> {
+        if queue_length == 0 {
+            return None;
+        }
+
+        let worker_count = self.workers.len();
+        if queue_length > AUTO_EXTEND_TRIGGER_SIZE && worker_count <= self.auto_extend_threshold {
+            // The workers size may be larger than the threshold, but that's okay since we won't
+            // add more workers from this point on, unless some workers are killed.
+            Some(worker_count + queue_length)
+        } else if queue_length == 0 && worker_count > self.init_size {
+            if worker_count == (self.init_size + 1) {
+                Some(self.init_size)
+            } else {
+                Some(((worker_count + self.init_size) / 2) as usize)
             }
-
+        } else {
             None
-        };
-
-        if let Some(change) = adjustment {
-            self.resize(change)
         }
     }
 }
@@ -145,6 +162,7 @@ impl PoolManager for ThreadPool {
         }
 
         let mut count = less;
+
         while count > 0 {
             if self.workers.len() == 0 {
                 break;
@@ -176,13 +194,14 @@ impl PoolManager for ThreadPool {
     }
 
     fn auto_adjust(&mut self) {
-        let adjustment = if let Ok(sender) = self.sender.lock() {
-            get_adjustment_target(&self, &sender)
-        } else {
-            None
-        };
+        let adjustment =
+            if let Ok(sender) = self.sender.lock() {
+                sender.len()
+            } else {
+                0
+            };
 
-        if let Some(change) = adjustment {
+        if let Some(change) = self.get_adjustment_target(adjustment) {
             self.resize(change);
         }
     }
@@ -220,6 +239,10 @@ impl PoolManager for ThreadPool {
                 thread.join().unwrap_or_else(|e| {
                     eprintln!("Unable to join the thread: {:?}", e);
                 });
+
+                if is_debug_mode() {
+                    println!("Worker {} is done...", worker.id);
+                }
             }
         }
     }
@@ -292,6 +315,7 @@ impl PoolState for ThreadPool {
             if found {
                 return Some(worker.id);
             }
+
             if worker.id == current_id {
                 found = true;
             }
@@ -320,48 +344,40 @@ impl Worker {
     fn new(my_id: usize, receiver: Arc<Mutex<Dispatcher>>, is_privilege: bool) -> Worker {
         let thread = thread::spawn(move || {
             let mut assignment = None;
-            let mut done = false;
-
-            let mut since = if is_privilege {
-                None
-            } else {
-                Some(SystemTime::now())
-            };
+            let mut since =
+                if is_privilege {
+                    None
+                } else {
+                    Some(SystemTime::now())
+                };
 
             loop {
-                if let Ok(rx) = receiver.lock() {
+                if let Ok(mut rx) = receiver.lock() {
+                    if !rx.subscribers.contains(&my_id) {
+                        return;
+                    }
+
                     if let Some(message) = rx.receiver.recv() {
-                        // receiving a new message
-                        assignment = Some(message);
-                        done = rx.subscribers.contains(&my_id);
+                        match message {
+                            Message::NewJob(job) => {
+                                assignment = Some(job)
+                            },
+                            Message::Terminate(target_id) => {
+                                if target_id == 0 {
+                                    return;
+                                } else {
+                                    rx.subscribers.remove(&target_id);
+                                }
+                            }
+                        }
                     } else {
                         // sender has been dropped
                         return;
                     }
                 }
 
-                if let Some(message) = assignment.take() {
-                    match message {
-                        Message::NewJob(job) => {
-                            job.call_box();
-
-                            if done {
-                                return;
-                            }
-
-                            if since.is_some() {
-                                since = Some(SystemTime::now());
-                            }
-                        }
-                        Message::Terminate(job_id) => {
-                            if job_id == 0 {
-                                return;
-                            }
-                            if job_id == my_id {
-                                return;
-                            }
-                        }
-                    }
+                if assignment.is_some() {
+                    Worker::handle_work(&mut assignment, &mut since)
                 }
             }
         });
@@ -382,23 +398,14 @@ impl Worker {
             });
         }
     }
-}
 
-fn get_adjustment_target(pool: &ThreadPool, sender: &channel::Sender<Message>) -> Option<usize> {
-    let worker_count = pool.workers.len();
-    let queue_length = sender.len();
+    fn handle_work(assignment: &mut Option<Job>, since: &mut Option<SystemTime>) {
+        if let Some(job) = assignment.take() {
+            job.call_box();
 
-    if queue_length > AUTO_EXTEND_TRIGGER_SIZE && worker_count <= pool.auto_extend_threshold {
-        // The workers size may be larger than the threshold, but that's okay since we won't
-        // add more workers from this point on, unless some workers are killed.
-        Some(worker_count + queue_length)
-    } else if queue_length == 0 && worker_count > pool.init_size {
-        if worker_count == (pool.init_size + 1) {
-            Some(pool.init_size)
-        } else {
-            Some(((worker_count + pool.init_size) / 2) as usize)
+            if since.is_some() {
+                *since = Some(SystemTime::now());
+            }
         }
-    } else {
-        None
     }
 }

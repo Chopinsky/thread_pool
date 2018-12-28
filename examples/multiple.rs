@@ -38,5 +38,7 @@ fn main() {
     t1.join().unwrap();
     t2.join().unwrap();
 
+    println!("We're done!");
+
     index_mode::close();
 }
