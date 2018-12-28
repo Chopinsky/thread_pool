@@ -1,7 +1,7 @@
 mod debug;
 mod multi_pools;
-mod single_pool;
 mod scheduler;
+mod single_pool;
 
 pub mod shared_mode {
     pub use crate::single_pool::{close, initialize, resize, run};

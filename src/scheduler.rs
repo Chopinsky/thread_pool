@@ -28,6 +28,7 @@ enum Message {
 struct Dispatcher {
     receiver: channel::Receiver<Message>,
     subscribers: HashSet<usize>,
+    graveyard: HashSet<usize>,
 }
 
 pub struct ThreadPool {
@@ -51,6 +52,7 @@ impl ThreadPool {
         let receiver = Arc::new(Mutex::new(Dispatcher {
             receiver,
             subscribers: HashSet::new(),
+            graveyard: HashSet::new(),
         }));
 
         let start = 1;
@@ -90,20 +92,18 @@ impl ThreadPool {
         }
     }
 
-    pub fn execute_automode<F: FnOnce() + Send + 'static>(&mut self, f: F) {
-        let adjustment =
-            if let Ok(sender) = self.sender.lock() {
-                sender.send(Message::NewJob(Box::new(f)));
-                sender.len()
-            } else {
-                0
-            };
+    pub fn execute_and_balance<F: FnOnce() + Send + 'static>(&mut self, f: F) {
+        let adjustment = if let Ok(sender) = self.sender.lock() {
+            sender.send(Message::NewJob(Box::new(f)));
+            sender.len()
+        } else {
+            0
+        };
 
         if let Some(change) = self.get_adjustment_target(adjustment) {
             self.resize(change);
         }
     }
-
 
     fn get_adjustment_target(&self, queue_length: usize) -> Option<usize> {
         if queue_length == 0 {
@@ -146,12 +146,12 @@ impl PoolManager for ThreadPool {
         // the start id is the next integer from the last worker's id
         let start = self.last_id + 1;
 
-        for id in 0..more {
-            let worker = Worker::new(start + id, Arc::clone(&self.receiver), false);
-            self.workers.push(worker);
-        }
-
-        //TODO: update subscribers
+        (0..more).for_each(|id| {
+            // Worker is created to subscribe, but would register self later when pulled from the
+            // workers queue
+            self.workers
+                .push(Worker::new(start + id, Arc::clone(&self.receiver), false));
+        });
 
         self.last_id += more;
     }
@@ -161,21 +161,15 @@ impl PoolManager for ThreadPool {
             return;
         }
 
-        let mut count = less;
+        let count = self.workers.len() - less;
+        let (_, workers) = self.workers.split_at(count);
 
-        while count > 0 {
-            if self.workers.len() == 0 {
-                break;
-            } else {
-                if let Some(mut worker) = self.workers.pop() {
-                    worker.terminate();
-                }
-
-                count -= 1;
+        if let Ok(sender) = self.sender.lock() {
+            for worker in workers {
+                // send the termination message -- async kill as this is not an urgent task
+                sender.send(Message::Terminate(worker.id));
             }
         }
-
-        //TODO: update subscribers
     }
 
     fn resize(&mut self, total: usize) {
@@ -194,12 +188,11 @@ impl PoolManager for ThreadPool {
     }
 
     fn auto_adjust(&mut self) {
-        let adjustment =
-            if let Ok(sender) = self.sender.lock() {
-                sender.len()
-            } else {
-                0
-            };
+        let adjustment = if let Ok(sender) = self.sender.lock() {
+            sender.len()
+        } else {
+            0
+        };
 
         if let Some(change) = self.get_adjustment_target(adjustment) {
             self.resize(change);
@@ -217,8 +210,10 @@ impl PoolManager for ThreadPool {
         while index < self.workers.len() {
             if self.workers[index].id == id {
                 // swap out the worker, use swap_remove for better performance.
-                let mut worker = self.workers.swap_remove(index);
-                worker.terminate();
+                let worker = self.workers.swap_remove(index);
+                if let Ok(sender) = self.sender.lock() {
+                    sender.send(Message::Terminate(worker.id));
+                }
 
                 return;
             }
@@ -344,29 +339,39 @@ impl Worker {
     fn new(my_id: usize, receiver: Arc<Mutex<Dispatcher>>, is_privilege: bool) -> Worker {
         let thread = thread::spawn(move || {
             let mut assignment = None;
-            let mut since =
-                if is_privilege {
-                    None
-                } else {
-                    Some(SystemTime::now())
-                };
+            let mut since = if is_privilege {
+                None
+            } else {
+                Some(SystemTime::now())
+            };
 
             loop {
                 if let Ok(mut rx) = receiver.lock() {
+                    // update subscribers
                     if !rx.subscribers.contains(&my_id) {
-                        return;
+                        if rx.graveyard.contains(&my_id) {
+                            // actually remove the subscriber and clean up the graveyard
+                            rx.graveyard.remove(&my_id);
+                            return;
+                        } else {
+                            // async add the new worker, if not killed yet
+                            rx.subscribers.insert(my_id);
+                        }
                     }
 
                     if let Some(message) = rx.receiver.recv() {
                         match message {
-                            Message::NewJob(job) => {
-                                assignment = Some(job)
-                            },
+                            Message::NewJob(job) => assignment = Some(job),
                             Message::Terminate(target_id) => {
                                 if target_id == 0 {
+                                    // all clear signal, remove self from both lists
+                                    rx.subscribers.remove(&my_id);
+                                    rx.graveyard.remove(&my_id);
                                     return;
                                 } else {
+                                    // async kill signal, update the lists with the target id
                                     rx.subscribers.remove(&target_id);
+                                    rx.graveyard.insert(target_id);
                                 }
                             }
                         }
@@ -385,17 +390,6 @@ impl Worker {
         Worker {
             id: my_id,
             thread: Some(thread),
-        }
-    }
-
-    fn terminate(&mut self) {
-        if let Some(thread) = self.thread.take() {
-            // >_> kill the thread in another thread is less ideal, but we're not blocking!
-            thread::spawn(move || {
-                thread.join().unwrap_or_else(|e| {
-                    eprintln!("Failed to join the associated thread: {:?}", e);
-                });
-            });
         }
     }
 

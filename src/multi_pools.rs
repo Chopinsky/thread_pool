@@ -49,7 +49,7 @@ pub fn run_with<F: FnOnce() + Send + 'static>(key: String, f: F) {
             // if pool has been created
             if let Some(ref mut pool_info) = pool.store.get_mut(&key) {
                 if pool.auto_adjust_register.contains(&key) {
-                    pool_info.pool.execute_automode(f);
+                    pool_info.pool.execute_and_balance(f);
                 } else {
                     pool_info.pool.execute(f);
                 }

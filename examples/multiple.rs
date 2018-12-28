@@ -1,8 +1,8 @@
 extern crate threads_pool;
 
 use std::collections::HashMap;
-use std::time::Duration;
 use std::thread;
+use std::time::Duration;
 use threads_pool::index_mode;
 
 fn main() {

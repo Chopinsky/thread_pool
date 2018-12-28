@@ -43,7 +43,7 @@ pub fn run<F: FnOnce() + Send + 'static>(f: F) {
         if let Some(ref mut pool) = POOL {
             // if pool has been created, execute in proper mode.
             match &pool.auto_mode {
-                &true => pool.store.execute_automode(f),
+                &true => pool.store.execute_and_balance(f),
                 &false => pool.store.execute(f),
             }
 

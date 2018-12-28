@@ -1,7 +1,7 @@
 extern crate threads_pool;
 
-use std::time::Duration;
 use std::thread::sleep;
+use std::time::Duration;
 use threads_pool::shared_mode;
 
 fn main() {
