@@ -1,4 +1,6 @@
 mod debug;
+mod dispatcher;
+mod model;
 mod multi_pools;
 mod scheduler;
 mod single_pool;

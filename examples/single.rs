@@ -6,13 +6,31 @@ use threads_pool::shared_mode;
 
 fn main() {
     shared_mode::initialize(4);
+    let debug = false;
 
-    for num in 0..100 {
+    for num in 0..=200 {
+        println!("Sending job: {}...", num);
+
         shared_mode::run(move || {
-            println!("I'm in with: {}", num);
-            sleep(Duration::from_millis(10));
+            let mut count = 0;
+            let mut sum = 0;
+
+            while count <= num {
+                count += 1;
+                sum += count;
+            }
+
+            if debug && num % 7 == 0 {
+                // this will "sync" the parallel executions since printing to screen is a
+                // lock-protected, single thread-ish action.
+                println!("Executing job: {} ==> {}", num, sum);
+            }
+
+            sleep(Duration::from_millis(100));
         });
     }
+
+    println!("All jobs are sent...");
 
     shared_mode::close();
 }

@@ -10,4 +10,4 @@ license = "MIT"
 edition = "2018"
 
 [dependencies]
-crossbeam-channel = "^0.2.0"
+crossbeam-channel = "^0.3.0"
