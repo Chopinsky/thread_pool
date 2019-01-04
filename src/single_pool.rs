@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
-use super::scheduler::{PoolManager, ThreadPool};
+use crate::scheduler::{PoolManager, ThreadPool};
+use crate::debug::is_debug_mode;
 use std::mem;
 use std::sync::{Once, ONCE_INIT};
 use std::thread;
@@ -42,9 +43,15 @@ pub fn run<F: FnOnce() + Send + 'static>(f: F) {
     unsafe {
         if let Some(ref mut pool) = POOL {
             // if pool has been created, execute in proper mode.
-            match &pool.auto_mode {
+            let result = match &pool.auto_mode {
                 &true => pool.store.execute_and_balance(f),
                 &false => pool.store.execute(f),
+            };
+
+            if result.is_err() && is_debug_mode() {
+                if is_debug_mode() {
+                    eprintln!("The execution of this job has failed...");
+                }
             }
 
             return;
@@ -56,6 +63,10 @@ pub fn run<F: FnOnce() + Send + 'static>(f: F) {
         // meanwhile, lazy initialize (again?) the pool
         if POOL.is_none() {
             initialize(1);
+        }
+
+        if is_debug_mode() {
+            eprintln!("The pool has been poisoned... The thread pool should be restarted...");
         }
     }
 }

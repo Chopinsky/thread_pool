@@ -3,19 +3,26 @@ use crossbeam_channel as channel;
 use std::collections::HashSet;
 use std::time::Duration;
 
-pub(crate) struct Dispatcher {
+const YIELD_DURATION: u64 = 255;
+
+pub(crate) struct Inbox {
     receiver: channel::Receiver<Message>,
     subscribers: HashSet<usize>,
     graveyard: HashSet<usize>,
 }
 
-impl Dispatcher {
-    pub(crate) fn new(receiver: channel::Receiver<Message>) -> Self {
-        Dispatcher {
-            receiver,
-            subscribers: HashSet::new(),
-            graveyard: HashSet::new(),
-        }
+impl Inbox {
+    pub(crate) fn new() -> (Self, channel::Sender<Message>) {
+        let (sender, receiver) = channel::unbounded();
+
+        (
+            Inbox {
+                receiver,
+                subscribers: HashSet::new(),
+                graveyard: HashSet::new(),
+            },
+            sender
+        )
     }
 
     pub(crate) fn insert(&mut self, id: usize) -> bool {
@@ -58,7 +65,7 @@ impl Dispatcher {
         self.subscribers.len()
     }
 
-    pub(crate) fn try_recv(&mut self) -> Result<Message, channel::RecvTimeoutError> {
-        self.receiver.recv_timeout(Duration::from_millis(255))
+    pub(crate) fn receive(&mut self) -> Result<Message, channel::RecvTimeoutError> {
+        self.receiver.recv_timeout(Duration::from_millis(YIELD_DURATION))
     }
 }

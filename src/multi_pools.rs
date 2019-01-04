@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
-use super::scheduler::{PoolManager, PoolState, ThreadPool};
+use crate::scheduler::{PoolManager, PoolState, ThreadPool};
+use crate::debug::is_debug_mode;
 use std::collections::{HashMap, HashSet};
 use std::mem;
 use std::sync::{Once, ONCE_INIT};
@@ -48,10 +49,16 @@ pub fn run_with<F: FnOnce() + Send + 'static>(key: String, f: F) {
         if let Some(ref mut pool) = MULTI_POOL {
             // if pool has been created
             if let Some(ref mut pool_info) = pool.store.get_mut(&key) {
-                if pool.auto_adjust_register.contains(&key) {
-                    pool_info.pool.execute_and_balance(f);
+                let result = if pool.auto_adjust_register.contains(&key) {
+                    pool_info.pool.execute_and_balance(f)
                 } else {
-                    pool_info.pool.execute(f);
+                    pool_info.pool.execute(f)
+                };
+
+                if result.is_err() && is_debug_mode() {
+                    if is_debug_mode() {
+                        eprintln!("The execution of this job has failed...");
+                    }
                 }
 
                 return;
@@ -66,6 +73,10 @@ pub fn run_with<F: FnOnce() + Send + 'static>(key: String, f: F) {
             let mut base_pool = HashMap::with_capacity(1);
             base_pool.insert(key, 1);
             initialize(base_pool);
+        }
+
+        if is_debug_mode() {
+            eprintln!("The pool has been poisoned... The thread pool should be restarted...");
         }
     }
 }
