@@ -1,11 +1,13 @@
-use crate::debug::is_debug_mode;
-use crate::inbox::*;
-use crate::model::*;
-use crossbeam_channel as channel;
 use std::sync::{Arc, RwLock, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime};
+use crossbeam_channel as channel;
+use crossbeam_channel::{SendError, SendTimeoutError};
+use crate::debug::is_debug_mode;
+use crate::inbox::*;
+use crate::model::*;
 
+static TIMEOUT_RETRY: i8 = 4;
 static THRESHOLD: usize = 100000;
 static AUTO_EXTEND_TRIGGER_SIZE: usize = 2;
 
@@ -68,63 +70,27 @@ impl ThreadPool {
     }
 
     pub fn execute<F: FnOnce() + Send + 'static>(&self, f: F) -> Result<(), ExecutionError> {
-        if let Ok(sender) = self.sender.write() {
-            match self.queue_timeout {
-                Some(wait_period) => {
-                    if sender
-                        .send_timeout(Message::NewJob(Box::new(f)), wait_period)
-                        .is_err()
-                    {
-                        return Err(ExecutionError::Timeout);
-                    }
-                },
-                None => {
-                    if sender.send(Message::NewJob(Box::new(f))).is_err() {
-                        return Err(ExecutionError::Disconnected);
-                    }
-                }
-            }
-
-            return Ok(())
+        match self.dispatch(Message::NewJob(Box::new(f)), -1) {
+            Err(SendTimeoutError::Timeout(_)) => Err(ExecutionError::Timeout),
+            Err(SendTimeoutError::Disconnected(_)) => Err(ExecutionError::Disconnected),
+            Ok(_) => Ok(()),
         }
-
-        Err(ExecutionError::PoolPoisoned)
     }
 
     pub fn execute_and_balance<F: FnOnce() + Send + 'static>(&mut self, f: F) -> Result<(), ExecutionError> {
-        let mut base_change = 0;
-
-        if let Ok(sender) = self.sender.write() {
-            if !sender.is_empty() {
-                // if the channel is not empty -- meaning workers are all busy at the moment, we need
-                // to double the size of the workers pool
-                base_change = sender.len();
-            }
-
-            match self.queue_timeout {
-                Some(wait_period) => {
-                    if sender
-                        .send_timeout(Message::NewJob(Box::new(f)), wait_period)
-                        .is_err()
-                    {
-                        return Err(ExecutionError::Timeout);
-                    }
-                },
-                None => {
-                    if sender.send(Message::NewJob(Box::new(f))).is_err() {
-                        return Err(ExecutionError::Disconnected);
+        match self.dispatch(Message::NewJob(Box::new(f)), 0) {
+            Err(SendTimeoutError::Timeout(_)) => Err(ExecutionError::Timeout),
+            Err(SendTimeoutError::Disconnected(_)) => Err(ExecutionError::Disconnected),
+            Ok(is_busy) => {
+                if is_busy {
+                    if let Some(change) = self.resize_target(self.init_size) {
+                        self.resize(change);
                     }
                 }
-            }
-        } else {
-            return Err(ExecutionError::PoolPoisoned);
-        };
 
-        if let Some(change) = self.resize_target(base_change) {
-            self.resize(change);
+                Ok(())
+            },
         }
-
-        Ok(())
     }
 
     fn resize_target(&self, queue_length: usize) -> Option<usize> {
@@ -146,6 +112,49 @@ impl ThreadPool {
         } else {
             None
         }
+    }
+
+    fn dispatch(&self, message: Message, retry: i8) -> Result<bool, SendTimeoutError<Message>> {
+        let mut is_busy = false;
+
+        if let Ok(sender) = self.sender.write() {
+            if !sender.is_empty() {
+                // if the channel is not empty -- meaning workers are all busy at the moment, we need
+                // to double the size of the workers pool
+                is_busy = true;
+            }
+
+            match self.queue_timeout {
+                Some(wait_period) => {
+                    let factor = if retry > 0 {
+                        retry as u32
+                    } else {
+                        1
+                    };
+
+                    return match sender.send_timeout(message, factor * wait_period) {
+                        Ok(()) => Ok(is_busy),
+                        Err(SendTimeoutError::Disconnected(msg)) => Err(SendTimeoutError::Disconnected(msg)),
+                        Err(SendTimeoutError::Timeout(msg)) => {
+                            if retry < 0 || retry > TIMEOUT_RETRY {
+                                return Err(SendTimeoutError::Timeout(msg));
+                            }
+
+                            return self.dispatch(msg, retry + 1);
+                        },
+                    };
+                },
+                None => {
+                    if let Err(SendError(message)) = sender.send(message) {
+                        return Err(SendTimeoutError::Disconnected(message));
+                    };
+                }
+            }
+        } else {
+            return Err(SendTimeoutError::Disconnected(message));
+        }
+
+        Ok(is_busy)
     }
 }
 
