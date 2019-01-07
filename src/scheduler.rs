@@ -1,4 +1,4 @@
-use std::sync::{Arc, RwLock, Mutex};
+use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc, RwLock, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime};
 use crossbeam_channel as channel;
@@ -11,6 +11,8 @@ static TIMEOUT_RETRY: i8 = 4;
 static THRESHOLD: usize = 100000;
 static AUTO_EXTEND_TRIGGER_SIZE: usize = 2;
 
+//TODO: use atomic int for read-write locking...
+
 pub enum ExecutionError {
     Timeout,
     Disconnected,
@@ -20,7 +22,7 @@ pub enum ExecutionError {
 pub struct ThreadPool {
     workers: Vec<Worker>,
     last_id: usize,
-    sender: RwLock<channel::Sender<Message>>,
+    sender: channel::Sender<Message>,
     receiver: Arc<Mutex<Inbox>>,
     auto_extend_threshold: usize,
     init_size: usize,
@@ -57,7 +59,7 @@ impl ThreadPool {
         ThreadPool {
             workers,
             last_id: start + pool_size - 1,
-            sender: RwLock::new(sender),
+            sender: sender,
             receiver: shared_receiver,
             auto_extend_threshold: THRESHOLD,
             init_size: pool_size,
@@ -77,7 +79,7 @@ impl ThreadPool {
         }
     }
 
-    pub fn execute_and_balance<F: FnOnce() + Send + 'static>(&mut self, f: F) -> Result<(), ExecutionError> {
+    pub fn execute_with_autoscale<F: FnOnce() + Send + 'static>(&mut self, f: F) -> Result<(), ExecutionError> {
         match self.dispatch(Message::NewJob(Box::new(f)), 0) {
             Err(SendTimeoutError::Timeout(_)) => Err(ExecutionError::Timeout),
             Err(SendTimeoutError::Disconnected(_)) => Err(ExecutionError::Disconnected),
@@ -115,43 +117,39 @@ impl ThreadPool {
     }
 
     fn dispatch(&self, message: Message, retry: i8) -> Result<bool, SendTimeoutError<Message>> {
-        let mut is_busy = false;
-
-        if let Ok(sender) = self.sender.write() {
-            if !sender.is_empty() {
-                // if the channel is not empty -- meaning workers are all busy at the moment, we need
-                // to double the size of the workers pool
-                is_busy = true;
-            }
-
-            match self.queue_timeout {
-                Some(wait_period) => {
-                    let factor = if retry > 0 {
-                        retry as u32
-                    } else {
-                        1
-                    };
-
-                    return match sender.send_timeout(message, factor * wait_period) {
-                        Ok(()) => Ok(is_busy),
-                        Err(SendTimeoutError::Disconnected(msg)) => Err(SendTimeoutError::Disconnected(msg)),
-                        Err(SendTimeoutError::Timeout(msg)) => {
-                            if retry < 0 || retry > TIMEOUT_RETRY {
-                                return Err(SendTimeoutError::Timeout(msg));
-                            }
-
-                            return self.dispatch(msg, retry + 1);
-                        },
-                    };
-                },
-                None => {
-                    if let Err(SendError(message)) = sender.send(message) {
-                        return Err(SendTimeoutError::Disconnected(message));
-                    };
-                }
-            }
+        let is_busy = if !self.sender.is_empty() {
+            // if the channel is not empty -- meaning workers are all busy at the moment, we need
+            // to double the size of the workers pool
+            true
         } else {
-            return Err(SendTimeoutError::Disconnected(message));
+            false
+        };
+
+        match self.queue_timeout {
+            Some(wait_period) => {
+                let factor = if retry > 0 {
+                    retry as u32
+                } else {
+                    1
+                };
+
+                return match self.sender.send_timeout(message, factor * wait_period) {
+                    Ok(()) => Ok(is_busy),
+                    Err(SendTimeoutError::Disconnected(msg)) => Err(SendTimeoutError::Disconnected(msg)),
+                    Err(SendTimeoutError::Timeout(msg)) => {
+                        if retry < 0 || retry > TIMEOUT_RETRY {
+                            return Err(SendTimeoutError::Timeout(msg));
+                        }
+
+                        return self.dispatch(msg, retry + 1);
+                    },
+                };
+            },
+            None => {
+                if let Err(SendError(message)) = self.sender.send(message) {
+                    return Err(SendTimeoutError::Disconnected(message));
+                };
+            }
         }
 
         Ok(is_busy)
@@ -195,12 +193,10 @@ impl PoolManager for ThreadPool {
         let count = self.workers.len() - less;
         let (_, workers) = self.workers.split_at(count);
 
-        if let Ok(sender) = self.sender.read() {
-            for worker in workers {
-                // send the termination message -- async kill as this is not an urgent task
-                if sender.send(Message::Terminate(worker.id)).is_err() && is_debug_mode() {
-                    eprintln!("Failed to send the termination message to worker: {}", worker.id);
-                }
+        for worker in workers {
+            // send the termination message -- async kill as this is not an urgent task
+            if self.sender.send(Message::Terminate(worker.id)).is_err() && is_debug_mode() {
+                eprintln!("Failed to send the termination message to worker: {}", worker.id);
             }
         }
     }
@@ -221,20 +217,14 @@ impl PoolManager for ThreadPool {
     }
 
     fn auto_adjust(&mut self) {
-        let curr = if let Ok(sender) = self.sender.read() {
-            sender.len()
-        } else {
-            0
-        };
-
-        if let Some(change) = self.resize_target(curr) {
+        if let Some(change) = self.resize_target(self.get_queue_length()) {
             self.resize(change);
         }
     }
 
     // Let extended workers to expire when idling for too long.
     fn auto_expire(&mut self) {
-        // send query messages
+        // TODO: set query messages
     }
 
     fn kill_worker(&mut self, id: usize) {
@@ -244,10 +234,8 @@ impl PoolManager for ThreadPool {
             if self.workers[index].id == id {
                 // swap out the worker, use swap_remove for better performance.
                 let worker = self.workers.swap_remove(index);
-                if let Ok(sender) = self.sender.write() {
-                    if sender.send(Message::Terminate(worker.id)).is_err() && is_debug_mode() {
-                        eprintln!("Failed to send the termination message to worker: {}", id);
-                    }
+                if self.sender.send(Message::Terminate(worker.id)).is_err() && is_debug_mode() {
+                    eprintln!("Failed to send the termination message to worker: {}", id);
                 }
 
                 if is_debug_mode() {
@@ -263,10 +251,8 @@ impl PoolManager for ThreadPool {
 
     fn clear(&mut self) {
         let mut sent = false;
-        if let Ok(sender) = self.sender.write() {
-            if let Ok(()) = sender.send(Message::Terminate(0)) {
-                sent = true;
-            }
+        if let Ok(()) = self.sender.send(Message::Terminate(0)) {
+            sent = true;
         }
 
         if !sent {
@@ -284,7 +270,7 @@ impl PoolManager for ThreadPool {
 
 pub trait PoolState {
     fn get_size(&self) -> usize;
-    fn get_queue_length(&self) -> Result<usize, &'static str>;
+    fn get_queue_length(&self) -> usize;
     fn get_queue_size_threshold(&self) -> usize;
     fn set_queue_size_threshold(&mut self, threshold: usize);
     fn get_first_worker_id(&self) -> Option<usize>;
@@ -298,11 +284,9 @@ impl PoolState for ThreadPool {
         self.workers.len()
     }
 
-    fn get_queue_length(&self) -> Result<usize, &'static str> {
-        match self.sender.read() {
-            Ok(sender) => Ok(sender.len()),
-            Err(_) => Err("Unable to obtain message queue size"),
-        }
+    #[inline]
+    fn get_queue_length(&self) -> usize {
+        self.sender.len()
     }
 
     #[inline]

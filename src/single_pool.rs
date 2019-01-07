@@ -44,7 +44,7 @@ pub fn run<F: FnOnce() + Send + 'static>(f: F) {
         if let Some(ref mut pool) = POOL {
             // if pool has been created, execute in proper mode.
             let result = match &pool.auto_mode {
-                &true => pool.store.execute_and_balance(f),
+                &true => pool.store.execute_with_autoscale(f),
                 &false => pool.store.execute(f),
             };
 
