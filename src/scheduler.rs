@@ -1,15 +1,15 @@
-use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc, RwLock, Mutex};
-use std::thread;
-use std::time::{Duration, SystemTime};
+use std::collections::HashSet;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use crossbeam_channel as channel;
 use crossbeam_channel::{SendError, SendTimeoutError};
 use crate::debug::is_debug_mode;
-use crate::inbox::*;
 use crate::model::*;
+use crate::worker::*;
 
-static TIMEOUT_RETRY: i8 = 4;
-static THRESHOLD: usize = 100000;
-static AUTO_EXTEND_TRIGGER_SIZE: usize = 2;
+const TIMEOUT_RETRY: i8 = 4;
+const THRESHOLD: usize = 100000;
+const AUTO_EXTEND_TRIGGER_SIZE: usize = 2;
 
 //TODO: use atomic int for read-write locking...
 
@@ -20,12 +20,13 @@ pub enum ExecutionError {
 }
 
 pub struct ThreadPool {
-    workers: Vec<Worker>,
-    last_id: usize,
-    sender: channel::Sender<Message>,
-    receiver: Arc<Mutex<Inbox>>,
-    auto_extend_threshold: usize,
     init_size: usize,
+    last_id: usize,
+    workers: Vec<Worker>,
+    graveyard: Arc<RwLock<HashSet<usize>>>,
+    sender: channel::Sender<Message>,
+    receiver: channel::Receiver<Message>,
+    auto_extend_threshold: usize,
     queue_timeout: Option<Duration>,
 }
 
@@ -37,32 +38,28 @@ impl ThreadPool {
             _ => size,
         };
 
-        let (inbox, sender) = Inbox::new();
-        let shared_receiver = Arc::new(Mutex::new(inbox));
+        let (sender, receiver) = channel::unbounded();
+        let graveyard = Arc::new(RwLock::new(HashSet::new()));
 
         let start = 1;
         let mut workers = Vec::with_capacity(pool_size);
 
-        if let Ok(mut inner) = shared_receiver.lock() {
-            for id in 0..pool_size {
-                let worker_id = start + id;
-                inner.insert(worker_id);
-                workers.push(Worker::new(worker_id, Arc::clone(&shared_receiver), true));
-            }
+        (start..start + pool_size).for_each(|id| {
+            workers.push(Worker::new(id, receiver.clone(), Arc::clone(&graveyard), true));
+        });
 
-
-            if is_debug_mode() {
-                println!("Pool has been initialized with {} pools", workers.len());
-            }
+        if is_debug_mode() {
+            println!("Pool has been initialized with {} pools", workers.len());
         }
 
         ThreadPool {
-            workers,
-            last_id: start + pool_size - 1,
-            sender: sender,
-            receiver: shared_receiver,
-            auto_extend_threshold: THRESHOLD,
             init_size: pool_size,
+            last_id: start + pool_size - 1,
+            workers,
+            graveyard,
+            sender,
+            receiver,
+            auto_extend_threshold: THRESHOLD,
             queue_timeout: None,
         }
     }
@@ -164,6 +161,7 @@ pub trait PoolManager {
     fn auto_expire(&mut self);
     fn kill_worker(&mut self, id: usize);
     fn clear(&mut self);
+    fn close(&mut self);
 }
 
 impl PoolManager for ThreadPool {
@@ -179,7 +177,12 @@ impl PoolManager for ThreadPool {
             // Worker is created to subscribe, but would register self later when pulled from the
             // workers queue
             self.workers
-                .push(Worker::new(start + id, Arc::clone(&self.receiver), false));
+                .push(Worker::new(
+                    start + id,
+                    self.receiver.clone(),
+                    Arc::clone(&self.graveyard),
+                    false
+                ));
         });
 
         self.last_id += more;
@@ -194,9 +197,11 @@ impl PoolManager for ThreadPool {
         let (_, workers) = self.workers.split_at(count);
 
         for worker in workers {
+            //todo: instead of sending message, operate now!
+
             // send the termination message -- async kill as this is not an urgent task
-            if self.sender.send(Message::Terminate(worker.id)).is_err() && is_debug_mode() {
-                eprintln!("Failed to send the termination message to worker: {}", worker.id);
+            if self.sender.send(Message::Terminate(worker.get_id())).is_err() && is_debug_mode() {
+                eprintln!("Failed to send the termination message to worker: {}", worker.get_id());
             }
         }
     }
@@ -228,24 +233,20 @@ impl PoolManager for ThreadPool {
     }
 
     fn kill_worker(&mut self, id: usize) {
-        let mut index = 0;
-
-        while index < self.workers.len() {
-            if self.workers[index].id == id {
+        for idx in 0..self.workers.len() {
+            if self.workers[idx].get_id() == id {
                 // swap out the worker, use swap_remove for better performance.
-                let worker = self.workers.swap_remove(index);
-                if self.sender.send(Message::Terminate(worker.id)).is_err() && is_debug_mode() {
+                let worker = self.workers.swap_remove(idx);
+                if self.sender.send(Message::Terminate(worker.get_id())).is_err() && is_debug_mode() {
                     eprintln!("Failed to send the termination message to worker: {}", id);
                 }
 
                 if is_debug_mode() {
-                    println!("Worker {} is told to be terminated...", worker.id);
+                    println!("Worker {} is told to be terminated...", worker.get_id());
                 }
 
                 return;
             }
-
-            index += 1;
         }
     }
 
@@ -264,7 +265,16 @@ impl PoolManager for ThreadPool {
             return;
         }
 
-        self.workers.clear();
+        for worker in self.workers.drain(..) {
+            if is_debug_mode() {
+                println!("Retiring worker {}", worker.get_id());
+            }
+        }
+    }
+
+    fn close(&mut self) {
+        self.clear();
+
     }
 }
 
@@ -310,7 +320,7 @@ impl PoolState for ThreadPool {
 
     fn get_first_worker_id(&self) -> Option<usize> {
         if let Some(worker) = self.workers.first() {
-            return Some(worker.id);
+            return Some(worker.get_id());
         }
 
         None
@@ -318,7 +328,7 @@ impl PoolState for ThreadPool {
 
     fn get_last_worker_id(&self) -> Option<usize> {
         if let Some(worker) = self.workers.last() {
-            return Some(worker.id);
+            return Some(worker.get_id());
         }
 
         None
@@ -332,10 +342,10 @@ impl PoolState for ThreadPool {
         let mut found = false;
         for worker in &self.workers {
             if found {
-                return Some(worker.id);
+                return Some(worker.get_id());
             }
 
-            if worker.id == current_id {
+            if worker.get_id() == current_id {
                 found = true;
             }
         }
@@ -351,122 +361,5 @@ impl Drop for ThreadPool {
         }
 
         self.clear();
-    }
-}
-
-struct Worker {
-    id: usize,
-    thread: Option<thread::JoinHandle<()>>,
-}
-
-struct WorkerCommand {
-    done: bool,
-    work: Option<Job>,
-}
-
-impl Worker {
-    fn new(my_id: usize, inbox: Arc<Mutex<Inbox>>, is_privilege: bool) -> Worker {
-        let thread = thread::spawn(move || {
-            let mut command = WorkerCommand {
-                done: false,
-                work: None,
-            };
-
-            let mut since = if is_privilege {
-                None
-            } else {
-                Some(SystemTime::now())
-            };
-
-            loop {
-                if let Ok(mut locked_box) = inbox.lock() {
-                    // update subscribers
-                    if !locked_box.verify(my_id) {
-                        return;
-                    }
-
-                    //TODO: auto expire, if used, take effect here...
-
-                    match locked_box.receive() {
-                        Ok(message) => {
-                            // message is the only place that can update the "done" field
-                            Worker::unpack_message(message, my_id, &mut locked_box, &mut command);
-
-                            if command.done {
-                                return;
-                            }
-                        },
-                        Err(channel::RecvTimeoutError::Timeout) => {
-                            // yield the receiver lock to the next worker
-                            continue;
-                        },
-                        Err(channel::RecvTimeoutError::Disconnected) => {
-                            // sender has been dropped
-                            return;
-                        }
-                    }
-                }
-
-                if command.work.is_some() {
-                    Worker::handle_work(command.work.take(), &mut since)
-                }
-            }
-        });
-
-        Worker {
-            id: my_id,
-            thread: Some(thread),
-        }
-    }
-
-    fn handle_work(work: Option<Job>, since: &mut Option<SystemTime>) {
-        if let Some(work) = work {
-            work.call_box();
-
-            if since.is_some() {
-                *since = Some(SystemTime::now());
-            }
-        }
-    }
-
-    fn unpack_message(message: Message, worker_id: usize, inbox: &mut Inbox, command: &mut WorkerCommand) {
-        match message {
-            Message::NewJob(job) => {
-                command.work = Some(job);
-                return;
-            },
-            Message::Terminate(target_id) => {
-                if target_id == 0 && inbox.len() > 0 {
-                    // all clear signal, remove self from both lists
-                    inbox.kill(worker_id, false);
-                    inbox.clear();
-                } else if target_id == worker_id {
-                    // rare case, where the worker happen to pick up the message
-                    // to kill self, then do it
-                    inbox.kill(worker_id, false);
-                } else {
-                    // async kill signal, update the lists with the target id
-                    inbox.kill(target_id, true);
-                    return;
-                }
-            }
-        }
-
-        command.done = true;
-    }
-}
-
-impl Drop for Worker {
-    fn drop(&mut self) {
-        if is_debug_mode() {
-            println!("Dropping worker {}", self.id);
-        }
-
-        if let Some(thread) = self.thread.take() {
-            // make sure the work is done
-            thread.join().unwrap_or_else(|err| {
-                eprintln!("Unable to drop worker: {}, error: {:?}", self.id, err);
-            });
-        }
     }
 }

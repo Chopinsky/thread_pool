@@ -1,9 +1,10 @@
 mod debug;
 mod model;
 mod multi_pools;
-mod inbox;
+mod manager;
 mod scheduler;
 mod single_pool;
+mod worker;
 
 pub mod shared_mode {
     pub use crate::single_pool::{close, initialize, resize, run};
