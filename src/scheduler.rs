@@ -1,11 +1,9 @@
-use std::collections::HashSet;
-use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use crossbeam_channel as channel;
-use crossbeam_channel::{SendError, SendTimeoutError};
+use crossbeam_channel::{Receiver, Sender, SendError, SendTimeoutError};
 use crate::debug::is_debug_mode;
 use crate::model::*;
-use crate::worker::*;
+use crate::manager::*;
 
 const TIMEOUT_RETRY: i8 = 4;
 const THRESHOLD: usize = 100000;
@@ -21,11 +19,9 @@ pub enum ExecutionError {
 
 pub struct ThreadPool {
     init_size: usize,
-    last_id: usize,
-    workers: Vec<Worker>,
-    graveyard: Arc<RwLock<HashSet<usize>>>,
-    sender: channel::Sender<Message>,
-    receiver: channel::Receiver<Message>,
+    manager: Manager,
+    sender: Sender<Message>,
+    receiver: Receiver<Message>,
     auto_extend_threshold: usize,
     queue_timeout: Option<Duration>,
 }
@@ -39,24 +35,11 @@ impl ThreadPool {
         };
 
         let (sender, receiver) = channel::unbounded();
-        let graveyard = Arc::new(RwLock::new(HashSet::new()));
-
-        let start = 1;
-        let mut workers = Vec::with_capacity(pool_size);
-
-        (start..start + pool_size).for_each(|id| {
-            workers.push(Worker::new(id, receiver.clone(), Arc::clone(&graveyard), true));
-        });
-
-        if is_debug_mode() {
-            println!("Pool has been initialized with {} pools", workers.len());
-        }
+        let manager = Manager::new(pool_size, &receiver);
 
         ThreadPool {
             init_size: pool_size,
-            last_id: start + pool_size - 1,
-            workers,
-            graveyard,
+            manager,
             sender,
             receiver,
             auto_extend_threshold: THRESHOLD,
@@ -97,7 +80,7 @@ impl ThreadPool {
             return None;
         }
 
-        let worker_count = self.workers.len();
+        let worker_count = self.manager.workers_count();
         if queue_length > AUTO_EXTEND_TRIGGER_SIZE && worker_count <= self.auto_extend_threshold {
             // The workers size may be larger than the threshold, but that's okay since we won't
             // add more workers from this point on, unless some workers are killed.
@@ -170,22 +153,7 @@ impl PoolManager for ThreadPool {
             return;
         }
 
-        // the start id is the next integer from the last worker's id
-        let start = self.last_id + 1;
-
-        (0..more).for_each(|id| {
-            // Worker is created to subscribe, but would register self later when pulled from the
-            // workers queue
-            self.workers
-                .push(Worker::new(
-                    start + id,
-                    self.receiver.clone(),
-                    Arc::clone(&self.graveyard),
-                    false
-                ));
-        });
-
-        self.last_id += more;
+        self.manager.extend_by(more, &self.receiver);
     }
 
     fn shrink(&mut self, less: usize) {
@@ -193,12 +161,7 @@ impl PoolManager for ThreadPool {
             return;
         }
 
-        let count = self.workers.len() - less;
-        let (_, workers) = self.workers.split_at(count);
-
-        for worker in workers {
-            //todo: instead of sending message, operate now!
-
+        for worker in self.manager.shrink_by(less) {
             // send the termination message -- async kill as this is not an urgent task
             if self.sender.send(Message::Terminate(worker.get_id())).is_err() && is_debug_mode() {
                 eprintln!("Failed to send the termination message to worker: {}", worker.get_id());
@@ -211,7 +174,7 @@ impl PoolManager for ThreadPool {
             return;
         }
 
-        let worker_count = self.workers.len();
+        let worker_count = self.manager.workers_count();
         if total == worker_count {
             return;
         } else if total > worker_count {
@@ -233,20 +196,17 @@ impl PoolManager for ThreadPool {
     }
 
     fn kill_worker(&mut self, id: usize) {
-        for idx in 0..self.workers.len() {
-            if self.workers[idx].get_id() == id {
-                // swap out the worker, use swap_remove for better performance.
-                let worker = self.workers.swap_remove(idx);
-                if self.sender.send(Message::Terminate(worker.get_id())).is_err() && is_debug_mode() {
-                    eprintln!("Failed to send the termination message to worker: {}", id);
-                }
+        if !self.manager.dismiss_worker(id) {
+            // can't find the worker with the given id, quit now.
+            return;
+        }
 
-                if is_debug_mode() {
-                    println!("Worker {} is told to be terminated...", worker.get_id());
-                }
+        if self.sender.send(Message::Terminate(id)).is_err() && is_debug_mode() {
+            eprintln!("Failed to send the termination message to worker: {}", id);
+        }
 
-                return;
-            }
+        if is_debug_mode() {
+            println!("Worker {} is told to be terminated...", id);
         }
     }
 
@@ -265,11 +225,7 @@ impl PoolManager for ThreadPool {
             return;
         }
 
-        for worker in self.workers.drain(..) {
-            if is_debug_mode() {
-                println!("Retiring worker {}", worker.get_id());
-            }
-        }
+        self.manager.remove_all();
     }
 
     fn close(&mut self) {
@@ -291,7 +247,7 @@ pub trait PoolState {
 impl PoolState for ThreadPool {
     #[inline]
     fn get_size(&self) -> usize {
-        self.workers.len()
+        self.manager.workers_count()
     }
 
     #[inline]
@@ -319,45 +275,31 @@ impl PoolState for ThreadPool {
     }
 
     fn get_first_worker_id(&self) -> Option<usize> {
-        if let Some(worker) = self.workers.first() {
-            return Some(worker.get_id());
+        match self.manager.first_worker_id() {
+            0 => None,
+            id => Some(id),
         }
-
-        None
     }
 
     fn get_last_worker_id(&self) -> Option<usize> {
-        if let Some(worker) = self.workers.last() {
-            return Some(worker.get_id());
+        match self.manager.last_worker_id() {
+            0 => None,
+            id => Some(id),
         }
-
-        None
     }
 
     fn get_next_worker_id(&self, current_id: usize) -> Option<usize> {
-        if current_id >= self.workers.len() {
-            return None;
+        match self.manager.next_worker_id(current_id) {
+            0 => None,
+            id => Some(id),
         }
-
-        let mut found = false;
-        for worker in &self.workers {
-            if found {
-                return Some(worker.get_id());
-            }
-
-            if worker.get_id() == current_id {
-                found = true;
-            }
-        }
-
-        None
     }
 }
 
 impl Drop for ThreadPool {
     fn drop(&mut self) {
         if is_debug_mode() {
-            println!("Job done, sending terminate message to all workers.");
+            println!("Shutting down this individual pool, sending terminate message to all workers.");
         }
 
         self.clear();
