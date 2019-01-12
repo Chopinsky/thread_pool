@@ -6,7 +6,7 @@ use crossbeam_channel as channel;
 use crate::debug::is_debug_mode;
 use crate::model::*;
 
-const YIELD_DURATION: u64 = 16;
+const YIELD_DURATION: Duration = Duration::from_millis(16);
 
 pub(crate) struct Worker {
     id: usize,
@@ -47,7 +47,7 @@ impl Worker {
 
                 //TODO: auto expire, if used, take effect here...
 
-                match rx.recv_timeout(Duration::from_millis(YIELD_DURATION)) {
+                match rx.recv_timeout(YIELD_DURATION) {
                     Ok(message) => {
                         // message is the only place that can update the "done" field
                         Worker::unpack_message(message, &mut courier);

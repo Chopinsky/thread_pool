@@ -216,16 +216,12 @@ impl PoolManager for ThreadPool {
             sent = true;
         }
 
-        if !sent {
+        if !sent && is_debug_mode(){
             // abort the clear process if we can't send the terminate message
-            if is_debug_mode() {
-                eprintln!("Failed to send the terminate message, please try again...");
-            }
-
-            return;
+            eprintln!("Failed to send the terminate message, please try again...");
         }
 
-        self.manager.remove_all();
+        self.manager.remove_all(sent);
     }
 
     fn close(&mut self) {

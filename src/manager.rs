@@ -39,15 +39,19 @@ impl Manager {
         }
     }
 
-    pub(crate) fn remove_all(&mut self) {
+    pub(crate) fn remove_all(&mut self, wait: bool) {
         for mut worker in self.workers.drain(..) {
             if is_debug_mode() {
                 println!("Sync retiring worker {}", worker.get_id());
             }
 
             // call retire so we will block until all workers have been awakened again, meaning
-            // all their work is now done and threads joined.
-            worker.retire();
+            // all their work is now done and threads joined. Only do this if the shutdown message
+            // is delivered such that workers may be able to quit the infinite-loop and join the
+            // thread later.
+            if wait {
+                worker.retire();
+            }
         }
     }
 }
