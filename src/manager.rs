@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use crossbeam_channel::Receiver;
 use crate::debug::is_debug_mode;
 use crate::model::Message;
@@ -11,11 +12,13 @@ pub(crate) struct Manager {
     workers: Vec<Worker>,
     last_id: usize,
     graveyard: Arc<RwLock<HashSet<usize>>>,
+    worker_life: Arc<RwLock<Duration>>,
 }
 
 impl Manager {
     pub(crate) fn new(range: usize, rx: &Receiver<Message>) -> Manager {
         let mut workers = Vec::with_capacity(range);
+        let worker_life = Arc::new(RwLock::new(Duration::from_millis(0)));
         let graveyard =
             Arc::new(RwLock::new(HashSet::with_capacity(range)));
 
@@ -24,7 +27,8 @@ impl Manager {
                 id,
                 rx.clone(),
                 Arc::clone(&graveyard),
-                true
+                Arc::clone(&worker_life),
+                true,
             ));
         });
 
@@ -36,6 +40,7 @@ impl Manager {
             workers,
             last_id: START_ID + range - 1,
             graveyard,
+            worker_life,
         }
     }
 
@@ -58,6 +63,7 @@ impl Manager {
 
 pub(crate) trait WorkerManagement {
     fn workers_count(&self) -> usize;
+    fn worker_auto_expire(&mut self, life: Duration);
     fn extend_by(&mut self, more: usize, receiver: &Receiver<Message>);
     fn shrink_by(&mut self, less:usize) -> Vec<Worker>;
     fn dismiss_worker(&mut self, id: usize) -> bool;
@@ -69,6 +75,14 @@ pub(crate) trait WorkerManagement {
 impl WorkerManagement for Manager {
     fn workers_count(&self) -> usize {
         self.workers.len()
+    }
+
+    fn worker_auto_expire(&mut self, life: Duration) {
+        if let Ok(mut expected_life) = self.worker_life.write() {
+            if *expected_life != life {
+                *expected_life = life;
+            }
+        }
     }
 
     fn extend_by(&mut self, more: usize, receiver: &Receiver<Message>) {
@@ -85,7 +99,8 @@ impl WorkerManagement for Manager {
                     self.last_id + 1 + id,
                     receiver.clone(),
                     Arc::clone(&self.graveyard),
-                    false
+                    Arc::clone(&self.worker_life),
+                    false,
                 ));
         });
 
@@ -141,6 +156,6 @@ impl WorkerManagement for Manager {
 
 impl Drop for Manager {
     fn drop(&mut self) {
-        self.remove_all();
+        self.remove_all(true);
     }
 }

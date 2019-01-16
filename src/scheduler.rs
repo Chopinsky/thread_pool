@@ -9,8 +9,6 @@ const TIMEOUT_RETRY: i8 = 4;
 const THRESHOLD: usize = 100000;
 const AUTO_EXTEND_TRIGGER_SIZE: usize = 2;
 
-//TODO: use atomic int for read-write locking...
-
 pub enum ExecutionError {
     Timeout,
     Disconnected,
@@ -141,7 +139,7 @@ pub trait PoolManager {
     fn shrink(&mut self, less: usize);
     fn resize(&mut self, total: usize);
     fn auto_adjust(&mut self);
-    fn auto_expire(&mut self);
+    fn auto_expire(&mut self, life: Option<Duration>);
     fn kill_worker(&mut self, id: usize);
     fn clear(&mut self);
     fn close(&mut self);
@@ -191,8 +189,15 @@ impl PoolManager for ThreadPool {
     }
 
     // Let extended workers to expire when idling for too long.
-    fn auto_expire(&mut self) {
+    fn auto_expire(&mut self, life: Option<Duration>) {
         // TODO: set query messages
+        let actual_life = if let Some(l) = life {
+            l
+        } else {
+            Duration::from_millis(0)
+        };
+
+        self.manager.worker_auto_expire(actual_life);
     }
 
     fn kill_worker(&mut self, id: usize) {

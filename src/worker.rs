@@ -20,10 +20,11 @@ struct WorkCourier {
 
 impl Worker {
     pub(crate) fn new(
-       my_id: usize,
-       rx: channel::Receiver<Message>,
-       graveyard: Arc<RwLock<HashSet<usize>>>,
-       is_privilege: bool
+        my_id: usize,
+        rx: channel::Receiver<Message>,
+        graveyard: Arc<RwLock<HashSet<usize>>>,
+        life: Arc<RwLock<Duration>>,
+        privileged: bool,
     ) -> Worker {
 
         let thread = thread::spawn(move || {
@@ -32,11 +33,13 @@ impl Worker {
                 work: None,
             };
 
-            let mut since = if is_privilege {
+            let mut since = if privileged {
                 None
             } else {
                 Some(SystemTime::now())
             };
+
+            let mut idle;
 
             loop {
                 if let Ok(g) = graveyard.read() {
@@ -44,8 +47,6 @@ impl Worker {
                         return;
                     }
                 }
-
-                //TODO: auto expire, if used, take effect here...
 
                 match rx.recv_timeout(YIELD_DURATION) {
                     Ok(message) => {
@@ -62,10 +63,16 @@ impl Worker {
                     }
                 }
 
-                // if there's a job, get it done first
-                if courier.work.is_some() {
+                // if there's a job, get it done first, and calc the idle period since last actual job
+                idle = if courier.work.is_some() {
                     Worker::handle_work(courier.work.take(), &mut since)
-                }
+                } else {
+                    Worker::calc_idle(&since)
+                };
+
+                //===========================
+                //    after-work handling
+                //===========================
 
                 // if it's a target kill, handle it now
                 if let Some(id) = courier.target_id.take() {
@@ -80,11 +87,32 @@ impl Worker {
                     } else if id == my_id {
                         // rare case, where the worker happen to pick up the message
                         // to kill self, then do it
+                        if let Ok(mut g) = graveyard.write() {
+                            g.remove(&my_id);
+                        }
+
                         return;
                     } else {
                         // async kill signal, update the lists with the target id
                         if let Ok(mut g) = graveyard.write() {
                             g.insert(id);
+                        }
+                    }
+                }
+
+                // if idled longer than the expected worker life for unprivileged workers,
+                // then we're done now -- self-purging.
+                if let Some(idle) = idle.take() {
+                    if let Ok(expected_life) = life.read() {
+                        if *expected_life > Duration::from_millis(0)
+                            && idle > *expected_life
+                        {
+                            // in case the worker is also to be killed.
+                            if let Ok(mut g) = graveyard.write() {
+                                g.remove(&my_id);
+                            }
+
+                            return;
                         }
                     }
                 }
@@ -112,14 +140,18 @@ impl Worker {
         }
     }
 
-    fn handle_work(work: Option<Job>, since: &mut Option<SystemTime>) {
+    fn handle_work(work: Option<Job>, since: &mut Option<SystemTime>) -> Option<Duration> {
+        let mut idle = None;
         if let Some(work) = work {
             work.call_box();
 
             if since.is_some() {
+                idle = Worker::calc_idle(&since);
                 *since = Some(SystemTime::now());
             }
         }
+
+        idle
     }
 
     fn unpack_message(
@@ -134,6 +166,16 @@ impl Worker {
                 courier.target_id = Some(target_id);
             }
         }
+    }
+
+    fn calc_idle(since: &Option<SystemTime>) -> Option<Duration> {
+        if since.is_some() {
+            if let Ok(e) = since.unwrap().elapsed() {
+                return Some(e);
+            }
+        }
+
+        None
     }
 }
 
