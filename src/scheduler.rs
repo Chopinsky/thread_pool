@@ -6,7 +6,8 @@ use crate::model::*;
 use crate::manager::*;
 
 const TIMEOUT_RETRY: i8 = 4;
-const THRESHOLD: usize = 100000;
+const CHAN_CAP: usize = 8;
+const THRESHOLD: usize = 65535;
 const AUTO_EXTEND_TRIGGER_SIZE: usize = 2;
 
 pub enum ExecutionError {
@@ -18,8 +19,8 @@ pub enum ExecutionError {
 pub struct ThreadPool {
     init_size: usize,
     manager: Manager,
-    sender: Sender<Message>,
-    receiver: Receiver<Message>,
+    chan: (Sender<Message>, Receiver<Message>),
+    priority_chan: (Sender<Message>, Receiver<Message>),
     auto_extend_threshold: usize,
     queue_timeout: Option<Duration>,
 }
@@ -32,14 +33,16 @@ impl ThreadPool {
             _ => size,
         };
 
-        let (sender, receiver) = channel::unbounded();
-        let manager = Manager::new(pool_size, &receiver);
+        let (sender, receiver) = channel::bounded(CHAN_CAP);
+        let (pri_rx, pri_tx) = channel::bounded(CHAN_CAP);
+
+        let manager = Manager::new(pool_size, &receiver, &pri_tx);
 
         ThreadPool {
             init_size: pool_size,
             manager,
-            sender,
-            receiver,
+            chan: (sender, receiver),
+            priority_chan: (pri_rx, pri_tx),
             auto_extend_threshold: THRESHOLD,
             queue_timeout: None,
         }
@@ -50,19 +53,18 @@ impl ThreadPool {
     }
 
     pub fn execute<F: FnOnce() + Send + 'static>(&self, f: F) -> Result<(), ExecutionError> {
-        match self.dispatch(Message::NewJob(Box::new(f)), -1) {
+        match self.dispatch(Message::NewJob(Box::new(f)), -1, false) {
+            Ok(_) => Ok(()),
             Err(SendTimeoutError::Timeout(_)) => Err(ExecutionError::Timeout),
             Err(SendTimeoutError::Disconnected(_)) => Err(ExecutionError::Disconnected),
-            Ok(_) => Ok(()),
+
         }
     }
 
     pub fn execute_with_autoscale<F: FnOnce() + Send + 'static>(&mut self, f: F) -> Result<(), ExecutionError> {
-        match self.dispatch(Message::NewJob(Box::new(f)), 0) {
-            Err(SendTimeoutError::Timeout(_)) => Err(ExecutionError::Timeout),
-            Err(SendTimeoutError::Disconnected(_)) => Err(ExecutionError::Disconnected),
-            Ok(is_busy) => {
-                if is_busy {
+        match self.dispatch(Message::NewJob(Box::new(f)), 0, false) {
+            Ok(was_busy) => {
+                if was_busy {
                     if let Some(change) = self.resize_target(self.init_size) {
                         self.resize(change);
                     }
@@ -70,6 +72,8 @@ impl ThreadPool {
 
                 Ok(())
             },
+            Err(SendTimeoutError::Timeout(_)) => Err(ExecutionError::Timeout),
+            Err(SendTimeoutError::Disconnected(_)) => Err(ExecutionError::Disconnected),
         }
     }
 
@@ -94,14 +98,14 @@ impl ThreadPool {
         }
     }
 
-    fn dispatch(&self, message: Message, retry: i8) -> Result<bool, SendTimeoutError<Message>> {
-        let is_busy = if !self.sender.is_empty() {
-            // if the channel is not empty -- meaning workers are all busy at the moment, we need
-            // to double the size of the workers pool
-            true
+    fn dispatch(&self, message: Message, retry: i8, with_priority: bool) -> Result<bool, SendTimeoutError<Message>> {
+        let chan = if with_priority {
+            &self.priority_chan.0
         } else {
-            false
+            &self.chan.0
         };
+
+        let was_busy = chan.is_full();
 
         match self.queue_timeout {
             Some(wait_period) => {
@@ -111,26 +115,26 @@ impl ThreadPool {
                     1
                 };
 
-                return match self.sender.send_timeout(message, factor * wait_period) {
-                    Ok(()) => Ok(is_busy),
+                return match chan.send_timeout(message, factor * wait_period) {
+                    Ok(()) => Ok(was_busy),
                     Err(SendTimeoutError::Disconnected(msg)) => Err(SendTimeoutError::Disconnected(msg)),
                     Err(SendTimeoutError::Timeout(msg)) => {
                         if retry < 0 || retry > TIMEOUT_RETRY {
                             return Err(SendTimeoutError::Timeout(msg));
                         }
 
-                        return self.dispatch(msg, retry + 1);
+                        return self.dispatch(msg, retry + 1, with_priority);
                     },
                 };
             },
             None => {
-                if let Err(SendError(message)) = self.sender.send(message) {
+                if let Err(SendError(message)) = chan.send(message) {
                     return Err(SendTimeoutError::Disconnected(message));
                 };
             }
         }
 
-        Ok(is_busy)
+        Ok(was_busy)
     }
 }
 
@@ -151,7 +155,7 @@ impl PoolManager for ThreadPool {
             return;
         }
 
-        self.manager.extend_by(more, &self.receiver);
+        self.manager.extend_by(more, &self.chan.1, &self.priority_chan.1);
     }
 
     fn shrink(&mut self, less: usize) {
@@ -161,7 +165,7 @@ impl PoolManager for ThreadPool {
 
         for worker in self.manager.shrink_by(less) {
             // send the termination message -- async kill as this is not an urgent task
-            if self.sender.send(Message::Terminate(worker.get_id())).is_err() && is_debug_mode() {
+            if self.chan.0.send(Message::Terminate(worker.get_id())).is_err() && is_debug_mode() {
                 eprintln!("Failed to send the termination message to worker: {}", worker.get_id());
             }
         }
@@ -206,7 +210,7 @@ impl PoolManager for ThreadPool {
             return;
         }
 
-        if self.sender.send(Message::Terminate(id)).is_err() && is_debug_mode() {
+        if self.chan.0.send(Message::Terminate(id)).is_err() && is_debug_mode() {
             eprintln!("Failed to send the termination message to worker: {}", id);
         }
 
@@ -217,7 +221,7 @@ impl PoolManager for ThreadPool {
 
     fn clear(&mut self) {
         let mut sent = false;
-        if let Ok(()) = self.sender.send(Message::Terminate(0)) {
+        if let Ok(()) = self.chan.0.send(Message::Terminate(0)) {
             sent = true;
         }
 
@@ -253,7 +257,7 @@ impl PoolState for ThreadPool {
 
     #[inline]
     fn get_queue_length(&self) -> usize {
-        self.sender.len()
+        self.chan.0.len()
     }
 
     #[inline]

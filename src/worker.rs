@@ -6,8 +6,6 @@ use crossbeam_channel as channel;
 use crate::debug::is_debug_mode;
 use crate::model::*;
 
-const YIELD_DURATION: Duration = Duration::from_millis(16);
-
 pub(crate) struct Worker {
     id: usize,
     thread: Option<thread::JoinHandle<()>>,
@@ -22,6 +20,7 @@ impl Worker {
     pub(crate) fn new(
         my_id: usize,
         rx: channel::Receiver<Message>,
+        pri_rx: channel::Receiver<Message>,
         graveyard: Arc<RwLock<HashSet<usize>>>,
         life: Arc<RwLock<Duration>>,
         privileged: bool,
@@ -39,7 +38,8 @@ impl Worker {
                 Some(SystemTime::now())
             };
 
-            let mut idle;
+            let mut idle: Option<Duration>;
+            let mut count: u8;
 
             loop {
                 if let Ok(g) = graveyard.read() {
@@ -48,26 +48,52 @@ impl Worker {
                     }
                 }
 
-                match rx.recv_timeout(YIELD_DURATION) {
-                    Ok(message) => {
-                        // message is the only place that can update the "done" field
-                        Worker::unpack_message(message, &mut courier);
-                    },
-                    Err(channel::RecvTimeoutError::Timeout) => {
-                        // yield the receiver lock to the next worker
-                        continue;
-                    },
-                    Err(channel::RecvTimeoutError::Disconnected) => {
-                        // sender has been dropped
-                        return;
+                count = 0;
+                loop {
+                    match pri_rx.try_recv() {
+                        Ok(message) => {
+                            // message is the only place that can update the "done" field
+                            Worker::unpack_message(message, &mut courier);
+                            break;
+                        },
+                        Err(channel::TryRecvError::Empty) => {
+                            // if chan empty, do nothing and fall through to the normal chan handle
+                        },
+                        Err(channel::TryRecvError::Disconnected) => {
+                            // sender has been dropped
+                            return;
+                        }
+                    };
+
+                    match rx.try_recv() {
+                        Ok(message) => {
+                            // message is the only place that can update the "done" field
+                            Worker::unpack_message(message, &mut courier);
+                            break;
+                        },
+                        Err(channel::TryRecvError::Empty) => {
+                            // update the trial counter
+                            count += 1;
+                        },
+                        Err(channel::TryRecvError::Disconnected) => {
+                            // sender has been dropped
+                            return;
+                        }
+                    };
+
+                    if count > 8 {
+                        // idled for too long, check the idle period
+                        break;
                     }
                 }
 
                 // if there's a job, get it done first, and calc the idle period since last actual job
                 idle = if courier.work.is_some() {
                     Worker::handle_work(courier.work.take(), &mut since)
-                } else {
+                } else if since.is_some() {
                     Worker::calc_idle(&since)
+                } else {
+                    None
                 };
 
                 //===========================
@@ -169,8 +195,8 @@ impl Worker {
     }
 
     fn calc_idle(since: &Option<SystemTime>) -> Option<Duration> {
-        if since.is_some() {
-            if let Ok(e) = since.unwrap().elapsed() {
+        if let Some(s) = since {
+            if let Ok(e) = s.elapsed() {
                 return Some(e);
             }
         }

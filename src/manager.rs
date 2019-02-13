@@ -16,7 +16,7 @@ pub(crate) struct Manager {
 }
 
 impl Manager {
-    pub(crate) fn new(range: usize, rx: &Receiver<Message>) -> Manager {
+    pub(crate) fn new(range: usize, rx: &Receiver<Message>, pri_rx: &Receiver<Message>) -> Manager {
         let mut workers = Vec::with_capacity(range);
         let worker_life = Arc::new(RwLock::new(Duration::from_millis(0)));
         let graveyard =
@@ -26,6 +26,7 @@ impl Manager {
             workers.push(Worker::new(
                 id,
                 rx.clone(),
+                pri_rx.clone(),
                 Arc::clone(&graveyard),
                 Arc::clone(&worker_life),
                 true,
@@ -64,7 +65,7 @@ impl Manager {
 pub(crate) trait WorkerManagement {
     fn workers_count(&self) -> usize;
     fn worker_auto_expire(&mut self, life: Duration);
-    fn extend_by(&mut self, more: usize, receiver: &Receiver<Message>);
+    fn extend_by(&mut self, more: usize, receiver: &Receiver<Message>, priority_receiver: &Receiver<Message>);
     fn shrink_by(&mut self, less:usize) -> Vec<Worker>;
     fn dismiss_worker(&mut self, id: usize) -> bool;
     fn first_worker_id(&self) -> usize;
@@ -85,7 +86,7 @@ impl WorkerManagement for Manager {
         }
     }
 
-    fn extend_by(&mut self, more: usize, receiver: &Receiver<Message>) {
+    fn extend_by(&mut self, more: usize, receiver: &Receiver<Message>, priority_receiver: &Receiver<Message>) {
         if more == 0 {
             return;
         }
@@ -98,6 +99,7 @@ impl WorkerManagement for Manager {
                 .push(Worker::new(
                     self.last_id + 1 + id,
                     receiver.clone(),
+                    priority_receiver.clone(),
                     Arc::clone(&self.graveyard),
                     Arc::clone(&self.worker_life),
                     false,

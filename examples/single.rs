@@ -6,18 +6,18 @@ use threads_pool::shared_mode;
 
 fn main() {
     shared_mode::initialize(4);
-    let debug = false;
+    let debug = true;
 
-    for num in 0..=200 {
+    for num in 0..=203 {
         println!("Sending job: {}...", num);
 
         shared_mode::run(move || {
-            let mut count = 0;
+            let mut count: u32 = 1;
             let mut sum = 0;
 
             while count <= num {
                 count += 1;
-                sum += count;
+                sum += count + count % 7;
             }
 
             if debug && num % 7 == 0 {
