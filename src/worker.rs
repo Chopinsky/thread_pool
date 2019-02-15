@@ -26,7 +26,7 @@ impl Worker {
         privileged: bool,
     ) -> Worker {
 
-        let thread = thread::spawn(move || {
+        let thread: thread::JoinHandle<()> = thread::spawn(move || {
             let mut courier = WorkCourier {
                 target_id: None,
                 work: None,
@@ -39,8 +39,9 @@ impl Worker {
             };
 
             let mut idle: Option<Duration>;
-            let mut count: u8;
+            let mut trials: u8;
 
+            // main worker loop
             loop {
                 if let Ok(g) = graveyard.read() {
                     if g.contains(&0) || g.contains(&my_id) {
@@ -48,22 +49,25 @@ impl Worker {
                     }
                 }
 
-                count = 0;
+                // wait for message loop
+                trials = 0;
                 loop {
-                    match pri_rx.try_recv() {
-                        Ok(message) => {
-                            // message is the only place that can update the "done" field
-                            Worker::unpack_message(message, &mut courier);
-                            break;
-                        },
-                        Err(channel::TryRecvError::Empty) => {
-                            // if chan empty, do nothing and fall through to the normal chan handle
-                        },
-                        Err(channel::TryRecvError::Disconnected) => {
-                            // sender has been dropped
-                            return;
-                        }
-                    };
+                    if pri_rx.len() > 2 || !rx.is_full() {
+                        match pri_rx.try_recv() {
+                            Ok(message) => {
+                                // message is the only place that can update the "done" field
+                                Worker::unpack_message(message, &mut courier);
+                                break;
+                            },
+                            Err(channel::TryRecvError::Empty) => {
+                                // if chan empty, do nothing and fall through to the normal chan handle
+                            },
+                            Err(channel::TryRecvError::Disconnected) => {
+                                // sender has been dropped
+                                return;
+                            }
+                        };
+                    }
 
                     match rx.try_recv() {
                         Ok(message) => {
@@ -73,7 +77,7 @@ impl Worker {
                         },
                         Err(channel::TryRecvError::Empty) => {
                             // update the trial counter
-                            count += 1;
+                            trials += 1;
                         },
                         Err(channel::TryRecvError::Disconnected) => {
                             // sender has been dropped
@@ -81,7 +85,7 @@ impl Worker {
                         }
                     };
 
-                    if count > 8 {
+                    if trials > 8 {
                         // idled for too long, check the idle period
                         break;
                     }

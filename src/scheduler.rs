@@ -33,7 +33,7 @@ impl ThreadPool {
             _ => size,
         };
 
-        let (sender, receiver) = channel::bounded(CHAN_CAP);
+        let (sender, receiver) = channel::bounded(CHAN_CAP / 2);
         let (pri_rx, pri_tx) = channel::bounded(CHAN_CAP);
 
         let manager = Manager::new(pool_size, &receiver, &pri_tx);
