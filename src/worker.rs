@@ -40,23 +40,44 @@ impl Worker {
 
             let mut idle: Option<Duration>;
             let mut trials: u8;
+            let mut pri_work_count: u8 = 0;
 
             // main worker loop
             loop {
+                // get ready to take new work from the channel
                 if let Ok(g) = graveyard.read() {
                     if g.contains(&0) || g.contains(&my_id) {
                         return;
                     }
                 }
 
-                // wait for message loop
+                // reset internal states
                 trials = 0;
+
+                // wait for message loop
                 loop {
-                    if pri_rx.len() > 2 || !rx.is_full() {
+                    if pri_work_count == 255 {
+                        // if the worker has performed 4 consecutive prioritized work and the normal
+                        // channel is full, we skip the priority work once to pick up a normal work
+                        // such that it won't be blocked forever; meanwhile, reset the counter.
+                        pri_work_count = 0;
+                    } else {
+                        // handle the priority queue if there're messages for work
                         match pri_rx.try_recv() {
                             Ok(message) => {
                                 // message is the only place that can update the "done" field
                                 Worker::unpack_message(message, &mut courier);
+
+                                if pri_work_count < 4 {
+                                    // only add if we're below the continuous pri-work cap
+                                    pri_work_count += 1;
+                                } else if rx.is_full() {
+                                    // if we've done 4 or more priority work in a row, check if
+                                    // we should skip if the normal channel is full and maybe
+                                    // blocking, by setting the special number
+                                    pri_work_count = 255;
+                                }
+
                                 break;
                             },
                             Err(channel::TryRecvError::Empty) => {
@@ -73,6 +94,7 @@ impl Worker {
                         Ok(message) => {
                             // message is the only place that can update the "done" field
                             Worker::unpack_message(message, &mut courier);
+                            pri_work_count = 0;
                             break;
                         },
                         Err(channel::TryRecvError::Empty) => {
@@ -85,7 +107,7 @@ impl Worker {
                         }
                     };
 
-                    if trials > 8 {
+                    if trials > 16 {
                         // idled for too long, check the idle period
                         break;
                     }
@@ -134,9 +156,7 @@ impl Worker {
                 // then we're done now -- self-purging.
                 if let Some(idle) = idle.take() {
                     if let Ok(expected_life) = life.read() {
-                        if *expected_life > Duration::from_millis(0)
-                            && idle > *expected_life
-                        {
+                        if *expected_life > Duration::from_millis(0) && idle > *expected_life {
                             // in case the worker is also to be killed.
                             if let Ok(mut g) = graveyard.write() {
                                 g.remove(&my_id);

@@ -6,7 +6,7 @@ use crate::model::*;
 use crate::manager::*;
 
 const TIMEOUT_RETRY: i8 = 4;
-const CHAN_CAP: usize = 8;
+const CHAN_CAP: usize = 16;
 const THRESHOLD: usize = 65535;
 const AUTO_EXTEND_TRIGGER_SIZE: usize = 2;
 
