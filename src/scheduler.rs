@@ -5,7 +5,7 @@ use crate::debug::is_debug_mode;
 use crate::model::*;
 use crate::manager::*;
 
-const TIMEOUT_RETRY: i8 = 4;
+const RETRY_LIMIT: i8 = 4;
 const CHAN_CAP: usize = 16;
 const THRESHOLD: usize = 65535;
 const AUTO_EXTEND_TRIGGER_SIZE: usize = 2;
@@ -22,6 +22,7 @@ pub struct ThreadPool {
     chan: (Sender<Message>, Receiver<Message>),
     priority_chan: (Sender<Message>, Receiver<Message>),
     auto_extend_threshold: usize,
+    auto_scale: bool,
     queue_timeout: Option<Duration>,
 }
 
@@ -44,6 +45,7 @@ impl ThreadPool {
             chan: (sender, receiver),
             priority_chan: (pri_rx, pri_tx),
             auto_extend_threshold: THRESHOLD,
+            auto_scale: false,
             queue_timeout: None,
         }
     }
@@ -52,21 +54,57 @@ impl ThreadPool {
         self.queue_timeout = timeout;
     }
 
-    pub fn execute<F: FnOnce() + Send + 'static>(&self, f: F) -> Result<(), ExecutionError> {
+    pub fn toggle_auto_scale(&mut self, auto_scale: bool) {
+        self.auto_scale = auto_scale;
+    }
+
+    pub fn exec<F: FnOnce() + Send + 'static>(
+        &mut self, f: F, prioritized: bool) -> Result<(), ExecutionError>
+    {
+        let retry = if self.auto_scale {
+            0
+        } else {
+            -1
+        };
+        
+        match self.dispatch(Message::NewJob(Box::new(f)), retry, prioritized) {
+            Ok(was_busy) => {
+                if was_busy && self.auto_scale {
+                    if let Some(target) = self.resize_target(self.init_size) {
+                        self.resize(target);
+                    }
+                }
+
+                Ok(())
+            },
+            Err(SendTimeoutError::Timeout(_)) => Err(ExecutionError::Timeout),
+            Err(SendTimeoutError::Disconnected(_)) => Err(ExecutionError::Disconnected),
+        }
+    }
+
+    pub fn execute<F: FnOnce() + Send + 'static>(
+        &self, f: F) -> Result<(), ExecutionError>
+    {
         match self.dispatch(Message::NewJob(Box::new(f)), -1, false) {
             Ok(_) => Ok(()),
             Err(SendTimeoutError::Timeout(_)) => Err(ExecutionError::Timeout),
             Err(SendTimeoutError::Disconnected(_)) => Err(ExecutionError::Disconnected),
-
         }
     }
 
-    pub fn execute_with_autoscale<F: FnOnce() + Send + 'static>(&mut self, f: F) -> Result<(), ExecutionError> {
+    #[deprecated(
+        since = "0.1.10",
+        note = "Setup auto-scale using self.toggle_auto_scale(true), then call \
+                function self.exec(...) instead; this API will be removed in 0.2.0"
+    )]
+    pub fn execute_with_autoscale<F: FnOnce() + Send + 'static>(
+        &mut self, f: F) -> Result<(), ExecutionError>
+    {
         match self.dispatch(Message::NewJob(Box::new(f)), 0, false) {
             Ok(was_busy) => {
                 if was_busy {
-                    if let Some(change) = self.resize_target(self.init_size) {
-                        self.resize(change);
+                    if let Some(target) = self.resize_target(self.init_size) {
+                        self.resize(target);
                     }
                 }
 
@@ -119,7 +157,7 @@ impl ThreadPool {
                     Ok(()) => Ok(was_busy),
                     Err(SendTimeoutError::Disconnected(msg)) => Err(SendTimeoutError::Disconnected(msg)),
                     Err(SendTimeoutError::Timeout(msg)) => {
-                        if retry < 0 || retry > TIMEOUT_RETRY {
+                        if retry < 0 || retry > RETRY_LIMIT {
                             return Err(SendTimeoutError::Timeout(msg));
                         }
 
@@ -135,6 +173,31 @@ impl ThreadPool {
         }
 
         Ok(was_busy)
+    }
+}
+
+pub trait ThreadPoolStates {
+    fn set_exec_timeout(&mut self, timeout: Option<Duration>);
+    fn get_exec_timeout(&self) -> Option<Duration>;
+    fn toggle_auto_scale(&mut self, auto_scale: bool);
+    fn auto_scale_enabled(&self) -> bool;
+}
+
+impl ThreadPoolStates for ThreadPool {
+    fn set_exec_timeout(&mut self, timeout: Option<Duration>) {
+        self.queue_timeout = timeout;
+    }
+
+    fn get_exec_timeout(&self) -> Option<Duration> {
+        self.queue_timeout.clone()
+    }
+
+    fn toggle_auto_scale(&mut self, auto_scale: bool) {
+        self.auto_scale = auto_scale;
+    }
+
+    fn auto_scale_enabled(&self) -> bool {
+        self.auto_scale
     }
 }
 

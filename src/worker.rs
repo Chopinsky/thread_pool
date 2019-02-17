@@ -55,7 +55,7 @@ impl Worker {
                 trials = 0;
 
                 // wait for message loop
-                loop {
+                while trials < 16 {
                     if pri_work_count == 255 {
                         // if the worker has performed 4 consecutive prioritized work and the normal
                         // channel is full, we skip the priority work once to pick up a normal work
@@ -98,8 +98,7 @@ impl Worker {
                             break;
                         },
                         Err(channel::TryRecvError::Empty) => {
-                            // update the trial counter
-                            trials += 1;
+                            // nothing to receive yet
                         },
                         Err(channel::TryRecvError::Disconnected) => {
                             // sender has been dropped
@@ -107,10 +106,8 @@ impl Worker {
                         }
                     };
 
-                    if trials > 16 {
-                        // idled for too long, check the idle period
-                        break;
-                    }
+                    // update the trial counter
+                    trials += 1;
                 }
 
                 // if there's a job, get it done first, and calc the idle period since last actual job

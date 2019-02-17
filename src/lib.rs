@@ -14,4 +14,4 @@ pub mod index_mode {
     pub use crate::multi_pools::{close, initialize, resize_pool, run_with};
 }
 
-pub use crate::scheduler::{ExecutionError, PoolManager, PoolState, ThreadPool};
+pub use crate::scheduler::{ExecutionError, PoolManager, PoolState, ThreadPool, ThreadPoolStates};

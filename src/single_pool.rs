@@ -17,22 +17,40 @@ struct Pool {
     auto_adjust_handler: Option<JoinHandle<()>>,
 }
 
+impl Pool {
+    #[inline]
+    fn inner() -> Option<&'static mut Pool> {
+        unsafe { POOL.as_mut() }
+    }
+
+    #[inline]
+    fn is_some() -> bool {
+        unsafe { POOL.is_some() }
+    }
+
+    #[inline]
+    fn toggle_auto_mode(&mut self, enabled: bool) {
+        if self.auto_mode == enabled {
+            return;
+        }
+
+        self.auto_mode = enabled;
+        self.store.toggle_auto_scale(enabled);
+    }
+}
+
 #[inline]
 pub fn initialize(size: usize) {
     initialize_with_auto_adjustment(size, None);
 }
 
 pub fn initialize_with_auto_adjustment(size: usize, period: Option<Duration>) {
+    assert!(!Pool::is_some(), "You are trying to initialize the thread pools multiple times!");
+
     let pool_size = match size {
         0 => 1,
         _ => size,
     };
-
-    unsafe {
-        if POOL.is_some() {
-            panic!("You are trying to initialize the thread pools multiple times!");
-        }
-    }
 
     ONCE.call_once(|| {
         create(pool_size, period);
@@ -40,35 +58,27 @@ pub fn initialize_with_auto_adjustment(size: usize, period: Option<Duration>) {
 }
 
 pub fn run<F: FnOnce() + Send + 'static>(f: F) {
-    unsafe {
-        if let Some(ref mut pool) = POOL {
+    match Pool::inner() {
+        Some(pool) => {
             // if pool has been created, execute in proper mode.
-            let result = match &pool.auto_mode {
-                &true => pool.store.execute_with_autoscale(f),
-                &false => pool.store.execute(f),
-            };
-
-            if result.is_err() && is_debug_mode() {
-                if is_debug_mode() {
-                    eprintln!("The execution of this job has failed...");
-                }
+            if pool.store.exec(f, false).is_err() && is_debug_mode() {
+                eprintln!("The execution of this job has failed...");
             }
 
             return;
-        }
-
-        // otherwise, spawn to a new thread for the work;
-        thread::spawn(f);
-
-        // meanwhile, lazy initialize (again?) the pool
-        if POOL.is_none() {
+        },
+        None => {
+            // lazy initialize (again?) the pool
             initialize(1);
-        }
 
-        if is_debug_mode() {
-            eprintln!("The pool has been poisoned... The thread pool should be restarted...");
-        }
-    }
+            // otherwise, spawn to a new thread for the work;
+            thread::spawn(f);
+
+            if is_debug_mode() {
+                eprintln!("The pool has been poisoned... The thread pool should be restarted...");
+            }
+        },
+    };
 }
 
 pub fn close() {
@@ -85,53 +95,45 @@ pub fn resize(size: usize) -> JoinHandle<()> {
             close();
         }
 
-        unsafe {
-            if let Some(ref mut pool) = POOL {
-                pool.store.resize(size);
-                return;
-            }
+        if let Some(pool) = Pool::inner() {
+            pool.store.resize(size);
+            return;
         }
 
         create(size, None);
     })
 }
 
-pub fn update_auto_adjustment_mode(enable: bool) {
-    unsafe {
-        if let Some(ref mut pool) = POOL {
-            if pool.auto_mode == enable {
-                return;
-            }
-
-            if !enable && pool.auto_adjust_handler.is_some() {
-                stop_auto_adjustment(pool);
-            }
-
-            pool.auto_mode = enable;
+pub fn update_auto_adjustment_mode(enabled: bool) {
+    if let Some(pool) = Pool::inner() {
+        if pool.auto_mode == enabled {
+            return;
         }
+
+        if !enabled && pool.auto_adjust_handler.is_some() {
+            stop_auto_adjustment(pool);
+        }
+
+        pool.toggle_auto_mode(enabled);
     }
 }
 
 pub fn reset_auto_adjustment_period(period: Option<Duration>) {
-    unsafe {
-        if let Some(ref mut pool) = POOL {
-            // stop the previous auto job regardless
-            stop_auto_adjustment(pool);
+    if let Some(pool) = Pool::inner() {
+        // stop the previous auto job regardless
+        stop_auto_adjustment(pool);
 
-            // initiate the new auto adjustment job if configured
-            if let Some(actual_period) = period {
-                pool.auto_mode = true;
-                pool.auto_adjust_handler = Some(start_auto_adjustment(actual_period));
-            }
+        // initiate the new auto adjustment job if configured
+        if let Some(actual_period) = period {
+            pool.toggle_auto_mode(true);
+            pool.auto_adjust_handler = Some(start_auto_adjustment(actual_period));
         }
     }
 }
 
 fn trigger_auto_adjustment() {
-    unsafe {
-        if let Some(ref mut pool) = POOL {
-            pool.store.auto_adjust();
-        }
+    if let Some(pool) = Pool::inner() {
+        pool.store.auto_adjust();
     }
 }
 
@@ -160,7 +162,7 @@ fn stop_auto_adjustment(pool: &mut Pool) {
         });
 
         if pool.auto_mode {
-            pool.auto_mode = false;
+            pool.toggle_auto_mode(false);
         }
     }
 }
@@ -176,15 +178,16 @@ fn create(size: usize, auto_adjustment: Option<Duration>) {
         (false, None)
     };
 
-    unsafe {
-        // Make the pool
-        let pool = Some(Pool {
-            store: Box::new(ThreadPool::new(size)),
-            auto_mode,
-            auto_adjust_handler: handler,
-        });
+    // Make the pool
+    let mut store = ThreadPool::new(size);
+    store.toggle_auto_scale(auto_mode);
 
-        // Put it in the heap so it can outlive this call
-        POOL = mem::transmute(pool);
-    }
+    let pool = Some(Pool {
+        store: Box::new(store),
+        auto_mode,
+        auto_adjust_handler: handler,
+    });
+
+    // Put it in the heap so it can outlive this call
+    unsafe { POOL = mem::transmute(pool); }
 }
