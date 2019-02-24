@@ -3,7 +3,6 @@
 use crate::scheduler::{PoolManager, PoolState, ThreadPool};
 use crate::debug::is_debug_mode;
 use std::collections::{HashMap, HashSet};
-use std::mem;
 use std::sync::{Once, ONCE_INIT};
 use std::thread;
 use std::thread::JoinHandle;
@@ -32,11 +31,15 @@ impl PoolStore {
 }
 
 #[inline]
-pub fn initialize(keys: HashMap<String, usize>) {
+pub fn initialize<S>(keys: HashMap<String, usize, S>)
+    where S: std::hash::BuildHasher
+{
     initialize_with_auto_adjustment(keys, None);
 }
 
-pub fn initialize_with_auto_adjustment(keys: HashMap<String, usize>, period: Option<Duration>) {
+pub fn initialize_with_auto_adjustment<S>(keys: HashMap<String, usize, S>, period: Option<Duration>)
+    where S: std::hash::BuildHasher
+{
     if keys.is_empty() {
         return;
     }
@@ -140,7 +143,9 @@ pub fn add_pool(key: String, size: usize) -> Option<JoinHandle<()>> {
     Some(handler)
 }
 
-fn create(keys: HashMap<String, usize>, period: Option<Duration>) {
+fn create<S>(keys: HashMap<String, usize, S>, period: Option<Duration>)
+    where S: std::hash::BuildHasher
+{
     let size = keys.len();
     let mut store = HashMap::with_capacity(size);
 
@@ -149,20 +154,17 @@ fn create(keys: HashMap<String, usize>, period: Option<Duration>) {
             continue;
         }
 
-        store.entry(key).or_insert(Box::new(ThreadPool::new(size)));
+        store.entry(key).or_insert_with(|| Box::new(ThreadPool::new(size)));
     }
-
-    // Make the pool
-    let pool = Some(PoolStore {
-        store,
-        auto_adjust_period: period,
-        auto_adjust_handler: None,
-        auto_adjust_register: HashSet::with_capacity(size),
-    });
 
     unsafe {
         // Put it in the heap so it can outlive this call
-        MULTI_POOL = mem::transmute(pool);
+        MULTI_POOL = Some(PoolStore {
+            store,
+            auto_adjust_period: period,
+            auto_adjust_handler: None,
+            auto_adjust_register: HashSet::with_capacity(size),
+        });
     }
 }
 
@@ -183,7 +185,7 @@ pub fn start_auto_adjustment(period: Duration) {
             period
         };
 
-        pools.auto_adjust_period = Some(actual_period.clone());
+        pools.auto_adjust_period = Some(actual_period);
         pools.auto_adjust_handler = Some(thread::spawn(move || {
             thread::sleep(actual_period);
 
@@ -235,27 +237,24 @@ pub fn toggle_pool_auto_mode(key: String, auto_adjust: bool) {
             pool_info.toggle_auto_scale(auto_adjust);
         }
 
-        match auto_adjust {
-            true => {
-                let to_launch_handler = pool.auto_adjust_register.is_empty();
+        if auto_adjust {
+            let to_launch_handler = pool.auto_adjust_register.is_empty();
 
-                pool.auto_adjust_register.insert(key);
+            pool.auto_adjust_register.insert(key);
 
-                if to_launch_handler {
-                    if let Some(period) = pool.auto_adjust_period {
-                        start_auto_adjustment(period);
-                    } else {
-                        start_auto_adjustment(Duration::from_secs(10));
-                    }
+            if to_launch_handler {
+                if let Some(period) = pool.auto_adjust_period {
+                    start_auto_adjustment(period);
+                } else {
+                    start_auto_adjustment(Duration::from_secs(10));
                 }
-            },
-            false => {
-                pool.auto_adjust_register.remove(&key);
-                if pool.auto_adjust_register.is_empty() {
-                    stop_auto_adjustment();
-                }
-            },
-        };
+            }
+        } else {
+            pool.auto_adjust_register.remove(&key);
+            if pool.auto_adjust_register.is_empty() {
+                stop_auto_adjustment();
+            }
+        }
     }
 }
 

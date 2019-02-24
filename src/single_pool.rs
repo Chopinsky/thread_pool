@@ -2,7 +2,6 @@
 
 use crate::scheduler::{PoolManager, ThreadPool};
 use crate::debug::is_debug_mode;
-use std::mem;
 use std::sync::{Once, ONCE_INIT};
 use std::thread;
 use std::thread::JoinHandle;
@@ -182,12 +181,12 @@ fn create(size: usize, auto_adjustment: Option<Duration>) {
     let mut store = ThreadPool::new(size);
     store.toggle_auto_scale(auto_mode);
 
-    let pool = Some(Pool {
-        store: Box::new(store),
-        auto_mode,
-        auto_adjust_handler: handler,
-    });
-
     // Put it in the heap so it can outlive this call
-    unsafe { POOL = mem::transmute(pool); }
+    unsafe {
+        POOL = Some(Pool {
+            store: Box::new(store),
+            auto_mode,
+            auto_adjust_handler: handler,
+        });
+    }
 }

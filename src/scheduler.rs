@@ -189,7 +189,7 @@ impl ThreadPoolStates for ThreadPool {
     }
 
     fn get_exec_timeout(&self) -> Option<Duration> {
-        self.queue_timeout.clone()
+        self.queue_timeout
     }
 
     fn toggle_auto_scale(&mut self, auto_scale: bool) {
