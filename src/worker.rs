@@ -6,6 +6,8 @@ use crossbeam_channel as channel;
 use crate::debug::is_debug_mode;
 use crate::model::*;
 
+const TIMEOUT: Duration = Duration::from_millis(1);
+
 pub(crate) struct Worker {
     id: usize,
     thread: Option<thread::JoinHandle<()>>,
@@ -63,7 +65,7 @@ impl Worker {
                         pri_work_count = 0;
                     } else {
                         // handle the priority queue if there're messages for work
-                        match pri_rx.try_recv() {
+                        match pri_rx.recv_timeout(TIMEOUT) {
                             Ok(message) => {
                                 // message is the only place that can update the "done" field
                                 Worker::unpack_message(message, &mut courier);
@@ -80,27 +82,27 @@ impl Worker {
 
                                 break;
                             },
-                            Err(channel::TryRecvError::Empty) => {
+                            Err(channel::RecvTimeoutError::Timeout) => {
                                 // if chan empty, do nothing and fall through to the normal chan handle
                             },
-                            Err(channel::TryRecvError::Disconnected) => {
+                            Err(channel::RecvTimeoutError::Disconnected) => {
                                 // sender has been dropped
                                 return;
                             }
                         };
                     }
 
-                    match rx.try_recv() {
+                    match rx.recv_timeout(TIMEOUT) {
                         Ok(message) => {
                             // message is the only place that can update the "done" field
                             Worker::unpack_message(message, &mut courier);
                             pri_work_count = 0;
                             break;
                         },
-                        Err(channel::TryRecvError::Empty) => {
+                        Err(channel::RecvTimeoutError::Timeout) => {
                             // nothing to receive yet
                         },
-                        Err(channel::TryRecvError::Disconnected) => {
+                        Err(channel::RecvTimeoutError::Disconnected) => {
                             // sender has been dropped
                             return;
                         }
