@@ -6,8 +6,8 @@ use crossbeam_channel as channel;
 use crate::debug::is_debug_mode;
 use crate::model::*;
 
-const PRI_TIMEOUT: Duration = Duration::from_micros(8);
-const NORM_TIMEOUT: Duration = Duration::from_micros(4);
+const PRI_TIMEOUT: Duration = Duration::from_micros(32);
+const NORM_TIMEOUT: Duration = Duration::from_micros(16);
 
 pub(crate) struct Worker {
     id: usize,
@@ -110,24 +110,7 @@ impl Worker {
                         };
                     }
 
-                    let work = if my_id % 2 == 0 && pri_rx.is_empty() {
-                        // if priority work queue is empty && even-id worker, wait for normal work
-                        // to come; otherwise, loop back to pick up the priority work (unless with
-                        // the 255 flag).
-                        rx.recv_timeout(NORM_TIMEOUT)
-                    } else {
-                        // otherwise, pick up the work immediately available, or loop back to check
-                        // the priority queue.
-                        rx.try_recv().map_err(|err| {
-                            if err == channel::TryRecvError::Disconnected {
-                                channel::RecvTimeoutError::Disconnected
-                            } else {
-                                channel::RecvTimeoutError::Timeout
-                            }
-                        })
-                    };
-
-                    match work {
+                    match rx.recv_timeout(NORM_TIMEOUT) {
                         Ok(message) => {
                             // message is the only place that can update the "done" field
                             Worker::unpack_message(message, &mut courier);
