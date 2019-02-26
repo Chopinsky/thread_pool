@@ -65,7 +65,22 @@ impl Worker {
                         pri_work_count = 0;
                     } else {
                         // handle the priority queue if there're messages for work
-                        match pri_rx.recv_timeout(TIMEOUT) {
+                        let pri_work = if rx.is_empty() {
+                            // if regular work queue is empty, park for priority work
+                            pri_rx.recv_timeout(TIMEOUT)
+                        } else {
+                            // otherwise, peek at the priority queue and move on to the normal queue
+                            // for work that is immediately available
+                            pri_rx.try_recv().map_err(|err| {
+                                if err == channel::TryRecvError::Disconnected {
+                                    channel::RecvTimeoutError::Disconnected
+                                } else {
+                                    channel::RecvTimeoutError::Timeout
+                                }
+                            })
+                        };
+
+                        match pri_work {
                             Ok(message) => {
                                 // message is the only place that can update the "done" field
                                 Worker::unpack_message(message, &mut courier);
