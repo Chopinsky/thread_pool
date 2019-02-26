@@ -23,7 +23,7 @@ impl Manager {
             Arc::new(RwLock::new(HashSet::with_capacity(range)));
 
         (START_ID..START_ID + range).for_each(|id| {
-            workers.push(Worker::new(
+            workers.push(Worker::start(
                 id,
                 rx.clone(),
                 pri_rx.clone(),
@@ -96,7 +96,7 @@ impl WorkerManagement for Manager {
             // Worker is created to subscribe, but would register self later when pulled from the
             // workers queue
             self.workers
-                .push(Worker::new(
+                .push(Worker::start(
                     self.last_id + 1 + id,
                     receiver.clone(),
                     priority_receiver.clone(),

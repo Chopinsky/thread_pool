@@ -21,6 +21,7 @@ pub struct ThreadPool {
     manager: Manager,
     chan: (Sender<Message>, Receiver<Message>),
     priority_chan: (Sender<Message>, Receiver<Message>),
+    upgrade_threshold: usize,
     auto_extend_threshold: usize,
     auto_scale: bool,
     queue_timeout: Option<Duration>,
@@ -34,7 +35,7 @@ impl ThreadPool {
             _ => size,
         };
 
-        let (sender, receiver) = channel::bounded(CHAN_CAP / 2);
+        let (sender, receiver) = channel::bounded(CHAN_CAP);
         let (pri_rx, pri_tx) = channel::bounded(CHAN_CAP);
 
         let manager = Manager::new(pool_size, &receiver, &pri_tx);
@@ -44,6 +45,7 @@ impl ThreadPool {
             manager,
             chan: (sender, receiver),
             priority_chan: (pri_rx, pri_tx),
+            upgrade_threshold: CHAN_CAP / 2,
             auto_extend_threshold: THRESHOLD,
             auto_scale: false,
             queue_timeout: None,
@@ -85,7 +87,7 @@ impl ThreadPool {
     pub fn execute<F: FnOnce() + Send + 'static>(
         &self, f: F) -> Result<(), ExecutionError>
     {
-        match self.dispatch(Message::NewJob(Box::new(f)), -1, false) {
+        match self.dispatch(Message::NewJob(Box::new(f)), -1, !self.priority_chan.0.is_full()) {
             Ok(_) => Ok(()),
             Err(SendTimeoutError::Timeout(_)) => Err(ExecutionError::Timeout),
             Err(SendTimeoutError::Disconnected(_)) => Err(ExecutionError::Disconnected),
@@ -100,7 +102,7 @@ impl ThreadPool {
     pub fn execute_with_autoscale<F: FnOnce() + Send + 'static>(
         &mut self, f: F) -> Result<(), ExecutionError>
     {
-        match self.dispatch(Message::NewJob(Box::new(f)), 0, false) {
+        match self.dispatch(Message::NewJob(Box::new(f)), 0, !self.priority_chan.0.is_full()) {
             Ok(was_busy) => {
                 if was_busy {
                     if let Some(target) = self.resize_target(self.init_size) {
@@ -137,11 +139,14 @@ impl ThreadPool {
     }
 
     fn dispatch(&self, message: Message, retry: i8, with_priority: bool) -> Result<bool, SendTimeoutError<Message>> {
-        let chan = if with_priority {
-            &self.priority_chan.0
-        } else {
-            &self.chan.0
-        };
+        let chan =
+            if with_priority || (self.chan.0.is_empty() && self.priority_chan.0.len() <= self.upgrade_threshold) {
+                // squeeze the work into the priority chan first even if a normal work
+                &self.priority_chan.0
+            } else {
+                // normal work and then priority queue is full
+                &self.chan.0
+            };
 
         let was_busy = chan.is_full();
 
@@ -257,7 +262,6 @@ impl PoolManager for ThreadPool {
 
     // Let extended workers to expire when idling for too long.
     fn auto_expire(&mut self, life: Option<Duration>) {
-        // TODO: set query messages
         let actual_life = if let Some(l) = life {
             l
         } else {
