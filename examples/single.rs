@@ -1,6 +1,6 @@
 extern crate threads_pool;
 
-use std::thread::sleep;
+use std::thread;
 use std::time::Duration;
 use threads_pool::shared_mode;
 
@@ -26,7 +26,7 @@ fn main() {
                 println!("Executing job: {} ==> {}", num, sum);
             }
 
-            sleep(Duration::from_millis(100));
+            thread::sleep(Duration::from_millis(100));
         });
     }
 

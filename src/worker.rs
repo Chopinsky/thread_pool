@@ -5,17 +5,20 @@ use std::time::{Duration, SystemTime};
 use crossbeam_channel as channel;
 use crate::debug::is_debug_mode;
 use crate::model::*;
+use crate::scheduler::ThreadPool;
 
-const PRI_TIMEOUT: Duration = Duration::from_micros(32);
-const NORM_TIMEOUT: Duration = Duration::from_micros(16);
+const TIMEOUT: Duration = Duration::from_micros(16);
+const LONG_TIMEOUT: Duration = Duration::from_micros(96);
 
 pub(crate) struct Worker {
     id: usize,
     thread: Option<thread::JoinHandle<()>>,
 }
 
+struct Status(i8);
+
 struct WorkCourier {
-    target_id: Option<usize>,
+    target: Option<usize>,
     work: Option<Job>,
 }
 
@@ -31,7 +34,7 @@ impl Worker {
     {
         let thread: thread::JoinHandle<()> = thread::spawn(move || {
             let mut courier = WorkCourier {
-                target_id: None,
+                target: None,
                 work: None,
             };
 
@@ -42,92 +45,31 @@ impl Worker {
             };
 
             let mut idle: Option<Duration>;
-            let mut trials: u8;
             let mut pri_work_count: u8 = 0;
 
             // main worker loop
             loop {
                 // get ready to take new work from the channel
                 if let Ok(g) = graveyard.read() {
-                    if g.contains(&0) || g.contains(&my_id) {
+                    if g.contains(&my_id) {
+                        return;
+                    }
+
+                    if g.contains(&0)
+                        && (ThreadPool::is_forced_close() || pri_rx.is_empty() && rx.is_empty())
+                    {
+                        // if shutting down, check if we can abandon all work by checking forced
+                        // close flag, or when all work have been processed.
                         return;
                     }
                 }
 
-                // reset internal states
-                trials = 0;
-
                 // wait for work loop
-                while trials < 16 {
-                    if pri_work_count == 255 {
-                        // if the worker has performed 4 consecutive prioritized work and the normal
-                        // channel is full, we skip the priority work once to pick up a normal work
-                        // such that it won't be blocked forever; meanwhile, reset the counter.
-                        pri_work_count = 0;
-                    } else {
-                        // handle the priority queue if there're messages for work
-                        let pri_work = if my_id % 2 == 1 || rx.is_empty() {
-                            // if regular work queue is empty, wait for priority work; odd-id worker
-                            // always park for priority worker (even-id worker only does this if no
-                            // further normal work to do.
-                            pri_rx.recv_timeout(PRI_TIMEOUT)
-                        } else {
-                            // otherwise, peek at the priority queue and move on to the normal queue
-                            // for work that is immediately available
-                            pri_rx.try_recv().map_err(|err| {
-                                if err == channel::TryRecvError::Disconnected {
-                                    channel::RecvTimeoutError::Disconnected
-                                } else {
-                                    channel::RecvTimeoutError::Timeout
-                                }
-                            })
-                        };
-
-                        match pri_work {
-                            Ok(message) => {
-                                // message is the only place that can update the "done" field
-                                Worker::unpack_message(message, &mut courier);
-
-                                if pri_work_count < 4 {
-                                    // only add if we're below the continuous pri-work cap
-                                    pri_work_count += 1;
-                                } else if rx.is_full() {
-                                    // if we've done 4 or more priority work in a row, check if
-                                    // we should skip if the normal channel is full and maybe
-                                    // blocking, by setting the special number
-                                    pri_work_count = 255;
-                                }
-
-                                break;
-                            },
-                            Err(channel::RecvTimeoutError::Timeout) => {
-                                // if chan empty, do nothing and fall through to the normal chan handle
-                            },
-                            Err(channel::RecvTimeoutError::Disconnected) => {
-                                // sender has been dropped
-                                return;
-                            }
-                        };
-                    }
-
-                    match rx.recv_timeout(NORM_TIMEOUT) {
-                        Ok(message) => {
-                            // message is the only place that can update the "done" field
-                            Worker::unpack_message(message, &mut courier);
-                            pri_work_count = 0;
-                            break;
-                        },
-                        Err(channel::RecvTimeoutError::Timeout) => {
-                            // nothing to receive yet
-                        },
-                        Err(channel::RecvTimeoutError::Disconnected) => {
-                            // sender has been dropped
-                            return;
-                        }
-                    };
-
-                    // update the trial counter
-                    trials += 1;
+                if let Status(-1) =
+                    Worker::check_queues(my_id, &pri_rx, &rx, &mut pri_work_count, &mut courier)
+                {
+                    // if the channels are disconnected, return
+                    return;
                 }
 
                 // if there's a job, get it done first, and calc the idle period since last actual job
@@ -144,7 +86,7 @@ impl Worker {
                 //===========================
 
                 // if it's a target kill, handle it now
-                if let Some(id) = courier.target_id.take() {
+                if let Some(id) = courier.target.take() {
                     if id == 0 {
                         // all clear signal, remove self from both lists
                         if let Ok(mut g) = graveyard.write() {
@@ -207,6 +149,87 @@ impl Worker {
         }
     }
 
+    fn check_queues(
+        id: usize,
+        pri_chan: &channel::Receiver<Message>,
+        ord_chan: &channel::Receiver<Message>,
+        pri_work_count: &mut u8,
+        courier: &mut WorkCourier,
+    ) -> Status
+    {
+        // wait for work loop
+        if *pri_work_count < 255 {
+            // handle the priority queue if there're messages for work
+            let pri_work = if id % 4 == 0 {
+                // 1/3 of the workers would park for priority worker
+                pri_chan.recv_timeout(LONG_TIMEOUT)
+            } else {
+                // otherwise, peek at the priority queue and move on to the normal queue
+                // for work that is immediately available
+                pri_chan.recv_timeout(TIMEOUT)
+            };
+
+            match pri_work {
+                Ok(message) => {
+                    // message is the only place that can update the "done" field
+                    Worker::unpack_message(message, courier);
+
+                    if *pri_work_count < 4 {
+                        // only add if we're below the continuous pri-work cap
+                        *pri_work_count += 1;
+                    } else if ord_chan.is_full() {
+                        // if we've done 4 or more priority work in a row, check if
+                        // we should skip if the normal channel is full and maybe
+                        // blocking, by setting the special number
+                        *pri_work_count = 255;
+                    }
+
+                    return Status(0);
+                },
+                Err(channel::RecvTimeoutError::Disconnected) => {
+                    // sender has been dropped
+                    return Status(-1);
+                },
+                Err(channel::RecvTimeoutError::Timeout) => {
+                    // if chan empty, do nothing and fall through to the normal chan handle
+                    // fall-through
+                }
+            };
+        } else {
+            // if the worker has performed 4 consecutive prioritized work and the normal
+            // channel is full, we skip the priority work once to pick up a normal work
+            // such that it won't be blocked forever; meanwhile, reset the counter.
+            *pri_work_count = 0;
+        }
+
+        let ord_work = if id % 4 == 1 {
+            // 1/4 of the workers would always park for normal work
+            ord_chan.recv_timeout(LONG_TIMEOUT)
+        } else {
+            // otherwise, wait 16 us for work to come in.
+            ord_chan.recv_timeout(TIMEOUT)
+        };
+
+        match ord_work {
+            Ok(message) => {
+                // message is the only place that can update the "done" field
+                Worker::unpack_message(message, courier);
+                *pri_work_count = 0;
+
+                return Status(0);
+            },
+            Err(channel::RecvTimeoutError::Disconnected) => {
+                // sender has been dropped
+                return Status(-1);
+            },
+            Err(channel::RecvTimeoutError::Timeout) => {
+                // nothing to receive yet
+            }
+        };
+
+        Status(0)
+    }
+
     fn handle_work(work: Option<Job>, since: &mut Option<SystemTime>) -> Option<Duration> {
         let mut idle = None;
         if let Some(work) = work {
@@ -229,8 +252,8 @@ impl Worker {
             Message::NewJob(job) => {
                 courier.work = Some(job);
             },
-            Message::Terminate(target_id) => {
-                courier.target_id = Some(target_id);
+            Message::Terminate(target) => {
+                courier.target = Some(target);
             }
         }
     }

@@ -12,7 +12,8 @@ static ONCE: Once = ONCE_INIT;
 static mut MULTI_POOL: Option<PoolStore> = None;
 
 struct PoolStore {
-    store: HashMap<String, Box<ThreadPool>>,
+    store: HashMap<String, ThreadPool>,
+    closing: bool,
     auto_adjust_period: Option<Duration>,
     auto_adjust_handler: Option<JoinHandle<()>>,
     auto_adjust_register: HashSet<String>,
@@ -27,6 +28,14 @@ impl PoolStore {
     #[inline]
     fn is_some() -> bool {
         unsafe { MULTI_POOL.is_some() }
+    }
+}
+
+impl Drop for PoolStore {
+    fn drop(&mut self) {
+        if !self.closing {
+            close();
+        }
     }
 }
 
@@ -54,9 +63,15 @@ pub fn initialize_with_auto_adjustment<S>(keys: HashMap<String, usize, S>, perio
 pub fn run_with<F: FnOnce() + Send + 'static>(key: String, f: F) {
     match PoolStore::inner() {
         Some(pool) => {
+            // if pool has been created, execute in proper mode.
+            if pool.closing && is_debug_mode() {
+                eprintln!("Trying to run jobs when the pool is closing...");
+                return;
+            }
+
             // if pool has been created
-            if let Some(pool_info) = pool.store.get_mut(&key) {
-                if pool_info.exec(f, false).is_err() && is_debug_mode() {
+            if let Some(p) = pool.store.get_mut(&key) {
+                if p.exec(f, false).is_err() && is_debug_mode() {
                     eprintln!("The execution of this job has failed...");
                 }
 
@@ -64,13 +79,7 @@ pub fn run_with<F: FnOnce() + Send + 'static>(key: String, f: F) {
             }
         },
         None => {
-            // meanwhile, lazy initialize (again?) the pool
-            let mut base_pool = HashMap::with_capacity(1);
-            base_pool.insert(key, 1);
-
-            initialize(base_pool);
-
-            // otherwise, spawn to a new thread for the work;
+            // pool could have closed, just execute the job
             thread::spawn(f);
 
             if is_debug_mode() {
@@ -81,11 +90,19 @@ pub fn run_with<F: FnOnce() + Send + 'static>(key: String, f: F) {
 }
 
 pub fn close() {
-    unsafe {
-        if let Some(pool) = MULTI_POOL.take() {
-            for (_, mut pool_info) in pool.store {
-                pool_info.clear();
-            }
+    if let Some(pool) = unsafe { MULTI_POOL.take().as_mut() } {
+        pool.closing = true;
+        for (_, p) in pool.store.iter_mut() {
+            p.close();
+        }
+    }
+}
+
+pub fn force_close() {
+    if let Some(pool) = unsafe { MULTI_POOL.take().as_mut() } {
+        pool.closing = true;
+        for (_, p) in pool.store.iter_mut() {
+            p.force_close();
         }
     }
 }
@@ -114,7 +131,7 @@ pub fn remove_pool(key: String) -> Option<JoinHandle<()>> {
     let handler = thread::spawn(move || {
         if let Some(pools) = PoolStore::inner() {
             if let Some(mut pool_info) = pools.store.remove(&key) {
-                pool_info.clear();
+                pool_info.close();
             }
         }
     });
@@ -136,7 +153,7 @@ pub fn add_pool(key: String, size: usize) -> Option<JoinHandle<()>> {
                 }
             }
 
-            pools.store.insert(key, Box::new(ThreadPool::new(size)));
+            pools.store.insert(key, ThreadPool::new(size));
         }
     });
 
@@ -154,13 +171,14 @@ fn create<S>(keys: HashMap<String, usize, S>, period: Option<Duration>)
             continue;
         }
 
-        store.entry(key).or_insert_with(|| Box::new(ThreadPool::new(size)));
+        store.entry(key).or_insert_with(|| ThreadPool::new(size));
     }
 
     unsafe {
         // Put it in the heap so it can outlive this call
         MULTI_POOL = Some(PoolStore {
             store,
+            closing: false,
             auto_adjust_period: period,
             auto_adjust_handler: None,
             auto_adjust_register: HashSet::with_capacity(size),

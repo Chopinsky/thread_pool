@@ -4,11 +4,14 @@ use crossbeam_channel::{Receiver, Sender, SendError, SendTimeoutError};
 use crate::debug::is_debug_mode;
 use crate::model::*;
 use crate::manager::*;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const RETRY_LIMIT: i8 = 4;
 const CHAN_CAP: usize = 16;
 const THRESHOLD: usize = 65535;
 const AUTO_EXTEND_TRIGGER_SIZE: usize = 2;
+
+static mut FORCE_CLOSE: AtomicBool = AtomicBool::new(false);
 
 pub enum ExecutionError {
     Timeout,
@@ -25,6 +28,7 @@ pub struct ThreadPool {
     auto_extend_threshold: usize,
     auto_scale: bool,
     queue_timeout: Option<Duration>,
+    closing: bool,
 }
 
 impl ThreadPool {
@@ -49,6 +53,7 @@ impl ThreadPool {
             auto_extend_threshold: THRESHOLD,
             auto_scale: false,
             queue_timeout: None,
+            closing: false,
         }
     }
 
@@ -117,28 +122,11 @@ impl ThreadPool {
         }
     }
 
-    fn resize_target(&self, queue_length: usize) -> Option<usize> {
-        if queue_length == 0 {
-            return None;
-        }
-
-        let worker_count = self.manager.workers_count();
-        if queue_length > AUTO_EXTEND_TRIGGER_SIZE && worker_count <= self.auto_extend_threshold {
-            // The workers size may be larger than the threshold, but that's okay since we won't
-            // add more workers from this point on, unless some workers are killed.
-            Some(worker_count + queue_length)
-        } else if queue_length == 0 && worker_count > self.init_size {
-            if worker_count == (self.init_size + 1) {
-                Some(self.init_size)
-            } else {
-                Some(((worker_count + self.init_size) / 2) as usize)
-            }
-        } else {
-            None
-        }
-    }
-
     fn dispatch(&self, message: Message, retry: i8, with_priority: bool) -> Result<bool, SendTimeoutError<Message>> {
+        if self.closing {
+            return Err(SendTimeoutError::Disconnected(message));
+        }
+
         let chan =
             if with_priority || (self.chan.0.is_empty() && self.priority_chan.0.len() <= self.upgrade_threshold) {
                 // squeeze the work into the priority chan first even if a normal work
@@ -179,6 +167,31 @@ impl ThreadPool {
 
         Ok(was_busy)
     }
+
+    fn resize_target(&self, queue_length: usize) -> Option<usize> {
+        if queue_length == 0 {
+            return None;
+        }
+
+        let worker_count = self.manager.workers_count();
+        if queue_length > AUTO_EXTEND_TRIGGER_SIZE && worker_count <= self.auto_extend_threshold {
+            // The workers size may be larger than the threshold, but that's okay since we won't
+            // add more workers from this point on, unless some workers are killed.
+            Some(worker_count + queue_length)
+        } else if queue_length == 0 && worker_count > self.init_size {
+            if worker_count == (self.init_size + 1) {
+                Some(self.init_size)
+            } else {
+                Some(((worker_count + self.init_size) / 2) as usize)
+            }
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn is_forced_close() -> bool {
+        unsafe { FORCE_CLOSE.load(Ordering::SeqCst) }
+    }
 }
 
 pub trait ThreadPoolStates {
@@ -215,6 +228,7 @@ pub trait PoolManager {
     fn kill_worker(&mut self, id: usize);
     fn clear(&mut self);
     fn close(&mut self);
+    fn force_close(&mut self);
 }
 
 impl PoolManager for ThreadPool {
@@ -233,7 +247,7 @@ impl PoolManager for ThreadPool {
 
         for worker in self.manager.shrink_by(less) {
             // send the termination message -- async kill as this is not an urgent task
-            if self.chan.0.send(Message::Terminate(worker.get_id())).is_err() && is_debug_mode() {
+            if self.priority_chan.0.send(Message::Terminate(worker.get_id())).is_err() && is_debug_mode() {
                 eprintln!("Failed to send the termination message to worker: {}", worker.get_id());
             }
         }
@@ -277,7 +291,7 @@ impl PoolManager for ThreadPool {
             return;
         }
 
-        if self.chan.0.send(Message::Terminate(id)).is_err() && is_debug_mode() {
+        if self.priority_chan.0.send(Message::Terminate(id)).is_err() && is_debug_mode() {
             eprintln!("Failed to send the termination message to worker: {}", id);
         }
 
@@ -288,7 +302,7 @@ impl PoolManager for ThreadPool {
 
     fn clear(&mut self) {
         let mut sent = false;
-        if let Ok(()) = self.chan.0.send(Message::Terminate(0)) {
+        if let Ok(()) = self.priority_chan.0.send(Message::Terminate(0)) {
             sent = true;
         }
 
@@ -301,14 +315,20 @@ impl PoolManager for ThreadPool {
     }
 
     fn close(&mut self) {
+        self.closing = true;
         self.clear();
+    }
 
+    fn force_close(&mut self) {
+        unsafe { FORCE_CLOSE.store(true, Ordering::SeqCst); }
+        self.close();
     }
 }
 
 pub trait PoolState {
     fn get_size(&self) -> usize;
     fn get_queue_length(&self) -> usize;
+    fn get_priority_queue_length(&self) -> usize;
     fn get_queue_size_threshold(&self) -> usize;
     fn set_queue_size_threshold(&mut self, threshold: usize);
     fn get_first_worker_id(&self) -> Option<usize>;
@@ -325,6 +345,11 @@ impl PoolState for ThreadPool {
     #[inline]
     fn get_queue_length(&self) -> usize {
         self.chan.0.len()
+    }
+
+    #[inline]
+    fn get_priority_queue_length(&self) -> usize {
+            self.priority_chan.0.len()
     }
 
     #[inline]

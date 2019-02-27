@@ -11,7 +11,8 @@ static ONCE: Once = ONCE_INIT;
 static mut POOL: Option<Pool> = None;
 
 struct Pool {
-    store: Box<ThreadPool>,
+    store: ThreadPool,
+    closing: bool,
     auto_mode: bool,
     auto_adjust_handler: Option<JoinHandle<()>>,
 }
@@ -38,6 +39,14 @@ impl Pool {
     }
 }
 
+impl Drop for Pool {
+    fn drop(&mut self) {
+        if !self.closing {
+            close();
+        }
+    }
+}
+
 #[inline]
 pub fn initialize(size: usize) {
     initialize_with_auto_adjustment(size, None);
@@ -60,6 +69,11 @@ pub fn run<F: FnOnce() + Send + 'static>(f: F) {
     match Pool::inner() {
         Some(pool) => {
             // if pool has been created, execute in proper mode.
+            if pool.closing && is_debug_mode() {
+                eprintln!("Trying to run jobs when the pool is closing...");
+                return;
+            }
+
             if pool.store.exec(f, false).is_err() && is_debug_mode() {
                 eprintln!("The execution of this job has failed...");
             }
@@ -67,10 +81,7 @@ pub fn run<F: FnOnce() + Send + 'static>(f: F) {
             return;
         },
         None => {
-            // lazy initialize (again?) the pool
-            initialize(1);
-
-            // otherwise, spawn to a new thread for the work;
+            // This could happen after the pool is closed, just execute the job
             thread::spawn(f);
 
             if is_debug_mode() {
@@ -81,10 +92,16 @@ pub fn run<F: FnOnce() + Send + 'static>(f: F) {
 }
 
 pub fn close() {
-    unsafe {
-        if let Some(mut pool) = POOL.take() {
-            pool.store.clear();
-        }
+    if let Some(mut pool) = unsafe { POOL.take() } {
+        pool.closing = true;
+        pool.store.close();
+    }
+}
+
+pub fn force_close() {
+    if let Some(mut pool) = unsafe { POOL.take() } {
+        pool.closing = true;
+        pool.store.force_close();
     }
 }
 
@@ -184,7 +201,8 @@ fn create(size: usize, auto_adjustment: Option<Duration>) {
     // Put it in the heap so it can outlive this call
     unsafe {
         POOL = Some(Pool {
-            store: Box::new(store),
+            store,
+            closing: false,
             auto_mode,
             auto_adjust_handler: handler,
         });
