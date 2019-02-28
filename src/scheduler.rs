@@ -1,10 +1,10 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use crossbeam_channel as channel;
 use crossbeam_channel::{Receiver, Sender, SendError, SendTimeoutError};
 use crate::debug::is_debug_mode;
 use crate::model::*;
 use crate::manager::*;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 const RETRY_LIMIT: i8 = 4;
 const CHAN_CAP: usize = 16;

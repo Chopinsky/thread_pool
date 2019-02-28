@@ -1,8 +1,8 @@
-use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, SystemTime};
 use crossbeam_channel as channel;
+use hashbrown::HashSet;
 use crate::debug::is_debug_mode;
 use crate::model::*;
 use crate::scheduler::ThreadPool;

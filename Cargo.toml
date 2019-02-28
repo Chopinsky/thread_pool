@@ -11,3 +11,4 @@ edition = "2018"
 
 [dependencies]
 crossbeam-channel = "^0.3.0"
+hashbrown = "^0.1.8"

@@ -1,7 +1,7 @@
-use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use crossbeam_channel::Receiver;
+use hashbrown::HashSet;
 use crate::debug::is_debug_mode;
 use crate::model::Message;
 use crate::worker::Worker;

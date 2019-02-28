@@ -1,12 +1,12 @@
 #![allow(dead_code)]
 
-use crate::scheduler::{PoolManager, PoolState, ThreadPool};
-use crate::debug::is_debug_mode;
-use std::collections::{HashMap, HashSet};
 use std::sync::{Once, ONCE_INIT};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
+use hashbrown::{HashMap, HashSet};
+use crate::scheduler::{PoolManager, PoolState, ThreadPool};
+use crate::debug::is_debug_mode;
 
 static ONCE: Once = ONCE_INIT;
 static mut MULTI_POOL: Option<PoolStore> = None;
