@@ -1,35 +1,52 @@
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use std::vec;
 use crossbeam_channel::Receiver;
-use hashbrown::HashSet;
 use crate::debug::is_debug_mode;
-use crate::model::Message;
+use crate::model::{Message, WorkerUpdate};
 use crate::worker::Worker;
-
-const START_ID: usize = 1;
 
 pub(crate) struct Manager {
     workers: Vec<Worker>,
     last_id: usize,
-    graveyard: Arc<RwLock<HashSet<usize>>>,
-    worker_life: Arc<RwLock<Duration>>,
+    graveyard: Arc<RwLock<Vec<i8>>>,
+    max_idle: Arc<RwLock<Duration>>,
+    status_behavior: StatusBehaviors,
 }
 
 impl Manager {
     pub(crate) fn new(range: usize, rx: &Receiver<Message>, pri_rx: &Receiver<Message>) -> Manager {
-        let mut workers = Vec::with_capacity(range);
-        let worker_life = Arc::new(RwLock::new(Duration::from_millis(0)));
-        let graveyard =
-            Arc::new(RwLock::new(HashSet::with_capacity(range)));
+        Self::new_with_behavior(range, rx, pri_rx, None)
+    }
 
-        (START_ID..START_ID + range).for_each(|id| {
-            workers.push(Worker::start(
+    pub(crate) fn new_with_behavior(
+        range: usize,
+        rx: &Receiver<Message>,
+        pri_rx: &Receiver<Message>,
+        behavior: Option<StatusBehaviors>,
+    ) -> Manager
+    {
+        let mut workers = Vec::with_capacity(range);
+        let max_idle = Arc::new(RwLock::new(Duration::from_millis(0)));
+
+        let graveyard =
+            Arc::new(RwLock::new(vec::from_elem(0i8, range + 1)));
+
+        let status_behavior = if let Some(b) = behavior {
+            b
+        } else {
+            StatusBehaviors::default()
+        };
+
+        (1..=range).for_each(|id| {
+            workers.push(Worker::new(
                 id,
                 rx.clone(),
                 pri_rx.clone(),
                 Arc::clone(&graveyard),
-                Arc::clone(&worker_life),
+                Arc::clone(&max_idle),
                 true,
+                &status_behavior
             ));
         });
 
@@ -39,16 +56,19 @@ impl Manager {
 
         Manager {
             workers,
-            last_id: START_ID + range - 1,
+            last_id: range,
             graveyard,
-            worker_life,
+            max_idle,
+            status_behavior,
         }
     }
 
     pub(crate) fn remove_all(&mut self, wait: bool) {
         for mut worker in self.workers.drain(..) {
+            let id = worker.get_id();
+
             if is_debug_mode() {
-                println!("Sync retiring worker {}", worker.get_id());
+                println!("Sync retiring worker {}", id);
             }
 
             // call retire so we will block until all workers have been awakened again, meaning
@@ -56,7 +76,36 @@ impl Manager {
             // is delivered such that workers may be able to quit the infinite-loop and join the
             // thread later.
             if wait {
+                self.status_behavior.before_drop(id);
                 worker.retire();
+                self.status_behavior.after_drop(id);
+            }
+        }
+    }
+
+    fn mark_worker(&mut self, id: usize, status: i8) {
+        if let Ok(mut g) = self.graveyard.write() {
+            if id >= g.len() {
+                return;
+            }
+
+            g[id] = status;
+        }
+    }
+
+    fn graveyard_trim(&mut self) {
+        if let Ok(mut g) = self.graveyard.write() {
+            let mut idx = g.len();
+            while idx > 1 {
+                idx -= 1;
+                if g[idx] != -1 {
+                    break;
+                }
+            }
+
+            if idx > 0 && idx < g.len() {
+                g.truncate(idx + 1);  // index is 0-based, so length should be +1.
+                self.last_id = idx;
             }
         }
     }
@@ -67,7 +116,7 @@ pub(crate) trait WorkerManagement {
     fn worker_auto_expire(&mut self, life: Duration);
     fn extend_by(&mut self, more: usize, receiver: &Receiver<Message>, priority_receiver: &Receiver<Message>);
     fn shrink_by(&mut self, less:usize) -> Vec<Worker>;
-    fn dismiss_worker(&mut self, id: usize) -> bool;
+    fn dismiss_worker(&mut self, id: usize) -> Option<Worker>;
     fn first_worker_id(&self) -> usize;
     fn last_worker_id(&self) -> usize;
     fn next_worker_id(&self, curr_id: usize) -> usize;
@@ -79,8 +128,8 @@ impl WorkerManagement for Manager {
     }
 
     fn worker_auto_expire(&mut self, life: Duration) {
-        if let Ok(mut expected_life) = self.worker_life.write() {
-            if *expected_life != life {
+        if let Ok(mut expected_life) = self.max_idle.write() {
+            if expected_life.ne(&life) {
                 *expected_life = life;
             }
         }
@@ -91,20 +140,31 @@ impl WorkerManagement for Manager {
             return;
         }
 
+        // remove killed ids.
+        self.graveyard_trim();
+
         // the start id is the next integer from the last worker's id
-        (0..more).for_each(|id| {
+        (1..=more).for_each(|offset| {
             // Worker is created to subscribe, but would register self later when pulled from the
             // workers queue
+            let id = self.last_id + offset;
+
             self.workers
-                .push(Worker::start(
-                    self.last_id + 1 + id,
+                .push(Worker::new(
+                    id,
                     receiver.clone(),
                     priority_receiver.clone(),
                     Arc::clone(&self.graveyard),
-                    Arc::clone(&self.worker_life),
+                    Arc::clone(&self.max_idle),
                     false,
+                    &self.status_behavior
                 ));
         });
+
+        if let Ok(mut g) = self.graveyard.write() {
+            g.reserve_exact(more);
+            g.extend(vec::from_elem(0, more));
+        }
 
         self.last_id += more;
     }
@@ -115,19 +175,33 @@ impl WorkerManagement for Manager {
         }
 
         let start = self.workers.len() - less;
-        self.workers.drain(start..).collect()
+        let workers: Vec<Worker> = self.workers.drain(start..).collect();
+
+        if let Ok(mut g) = self.graveyard.write() {
+            workers.iter().for_each(|w| {
+                let id = w.get_id();
+                if id < g.len() {
+                    g[id] = -1;
+                }
+            });
+        }
+
+        // remove killed ids.
+        self.graveyard_trim();
+
+        workers
     }
 
-    fn dismiss_worker(&mut self, id: usize) -> bool {
+    fn dismiss_worker(&mut self, id: usize) -> Option<Worker> {
         for idx in 0..self.workers.len() {
             if self.workers[idx].get_id() == id {
                 // swap out the worker, use swap_remove for better performance.
-                self.workers.swap_remove(idx);
-                return true;
+                self.mark_worker(id, -1);
+                return Some(self.workers.swap_remove(idx));
             }
         }
 
-        false
+        None
     }
 
     fn first_worker_id(&self) -> usize {
@@ -159,5 +233,97 @@ impl WorkerManagement for Manager {
 impl Drop for Manager {
     fn drop(&mut self) {
         self.remove_all(true);
+    }
+}
+
+pub(crate) struct StatusBehaviors {
+    before_start: Option<WorkerUpdate>,
+    after_start: Option<WorkerUpdate>,
+    before_drop: Option<WorkerUpdate>,
+    after_drop: Option<WorkerUpdate>,
+}
+
+impl StatusBehaviors {
+    fn new() -> Self {
+        StatusBehaviors {
+            before_start: None,
+            after_start: None,
+            before_drop: None,
+            after_drop: None,
+        }
+    }
+}
+
+trait StatusBehaviorSetter {
+    fn set_before_start(&mut self, behavior: WorkerUpdate);
+    fn set_after_start(&mut self, behavior: WorkerUpdate);
+    fn set_before_drop(&mut self, behavior: WorkerUpdate);
+    fn set_after_drop(&mut self, behavior: WorkerUpdate);
+}
+
+impl StatusBehaviorSetter for StatusBehaviors {
+    fn set_before_start(&mut self, behavior: WorkerUpdate) {
+        self.before_start.replace(behavior);
+    }
+
+    fn set_after_start(&mut self, behavior: WorkerUpdate) {
+        self.after_start.replace(behavior);
+    }
+
+    fn set_before_drop(&mut self, behavior: WorkerUpdate) {
+        self.before_drop.replace(behavior);
+    }
+
+    fn set_after_drop(&mut self, behavior: WorkerUpdate) {
+        self.after_drop.replace(behavior);
+    }
+}
+
+pub(crate) trait StatusBehaviorDefinitions {
+    fn before_start(&self, id: usize);
+    fn after_start(&self, id: usize);
+    fn before_drop(&self, id: usize);
+    fn after_drop(&self, id: usize);
+    fn before_drop_clone(&self) -> Option<WorkerUpdate>;
+    fn after_drop_clone(&self) -> Option<WorkerUpdate>;
+}
+
+impl StatusBehaviorDefinitions for StatusBehaviors {
+    fn before_start(&self, id: usize) {
+        if let Some(behavior) = self.before_start {
+            behavior(id);
+        }
+    }
+
+    fn after_start(&self, id: usize) {
+        if let Some(behavior) = self.after_start {
+            behavior(id);
+        }
+    }
+
+    fn before_drop(&self, id: usize) {
+        if let Some(behavior) = self.before_drop {
+            behavior(id);
+        }
+    }
+
+    fn after_drop(&self, id: usize) {
+        if let Some(behavior) = self.after_drop {
+            behavior(id);
+        }
+    }
+
+    fn before_drop_clone(&self) -> Option<WorkerUpdate> {
+        self.before_drop.clone()
+    }
+
+    fn after_drop_clone(&self) -> Option<WorkerUpdate> {
+        self.after_drop.clone()
+    }
+}
+
+impl Default for StatusBehaviors {
+    fn default() -> Self {
+        Self::new()
     }
 }

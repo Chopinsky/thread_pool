@@ -2,8 +2,8 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, SystemTime};
 use crossbeam_channel as channel;
-use hashbrown::HashSet;
 use crate::debug::is_debug_mode;
+use crate::manager::{StatusBehaviors, StatusBehaviorDefinitions};
 use crate::model::*;
 use crate::scheduler::ThreadPool;
 
@@ -13,6 +13,8 @@ const LONG_TIMEOUT: Duration = Duration::from_micros(96);
 pub(crate) struct Worker {
     id: usize,
     thread: Option<thread::JoinHandle<()>>,
+    before_drop: Option<WorkerUpdate>,
+    after_drop: Option<WorkerUpdate>,
 }
 
 struct Status(i8);
@@ -23,16 +25,56 @@ struct WorkCourier {
 }
 
 impl Worker {
-    pub(crate) fn start(
+    pub(crate) fn new(
         my_id: usize,
         rx: channel::Receiver<Message>,
         pri_rx: channel::Receiver<Message>,
-        graveyard: Arc<RwLock<HashSet<usize>>>,
-        life: Arc<RwLock<Duration>>,
+        graveyard: Arc<RwLock<Vec<i8>>>,
+        max_idle: Arc<RwLock<Duration>>,
         privileged: bool,
+        behavior_definition: &StatusBehaviors,
     ) -> Worker
     {
-        let thread: thread::JoinHandle<()> = thread::spawn(move || {
+        behavior_definition.before_start(my_id);
+
+        let thread: thread::JoinHandle<()> =
+            Self::run(my_id, rx, pri_rx, graveyard, max_idle, privileged);
+
+        behavior_definition.after_start(my_id);
+
+        Worker {
+            id: my_id,
+            thread: Some(thread),
+            before_drop: behavior_definition.before_drop_clone(),
+            after_drop: behavior_definition.after_drop_clone(),
+        }
+    }
+
+    pub(crate) fn get_id(&self) -> usize {
+        self.id
+    }
+
+    // Calling `retire` on a worker will block the thread until the worker has done its work, or wake
+    // up from hibernation. This could block the caller for an undetermined amount of time.
+    pub(crate) fn retire(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            // make sure the work is done
+            thread.join().unwrap_or_else(|err| {
+                eprintln!("Unable to drop worker: {}, error: {:?}", self.id, err);
+            });
+        }
+    }
+
+    fn run(
+        my_id: usize,
+        rx: channel::Receiver<Message>,
+        pri_rx: channel::Receiver<Message>,
+        graveyard: Arc<RwLock<Vec<i8>>>,
+        max_idle: Arc<RwLock<Duration>>,
+        privileged: bool
+    ) -> thread::JoinHandle<()>
+    {
+        thread::spawn(move || {
             let mut courier = WorkCourier {
                 target: None,
                 work: None,
@@ -51,11 +93,16 @@ impl Worker {
             loop {
                 // get ready to take new work from the channel
                 if let Ok(g) = graveyard.read() {
-                    if g.contains(&my_id) {
+                    if my_id >= g.len() {
+                        // illegal case, always return
                         return;
                     }
 
-                    if g.contains(&0)
+                    if g[my_id] == -1 {
+                        return;
+                    }
+
+                    if g[0] == -1
                         && (ThreadPool::is_forced_close() || pri_rx.is_empty() && rx.is_empty())
                     {
                         // if shutting down, check if we can abandon all work by checking forced
@@ -66,7 +113,7 @@ impl Worker {
 
                 // wait for work loop
                 if let Status(-1) =
-                    Worker::check_queues(my_id, &pri_rx, &rx, &mut pri_work_count, &mut courier)
+                Worker::check_queues(my_id, &pri_rx, &rx, &mut pri_work_count, &mut courier)
                 {
                     // if the channels are disconnected, return
                     return;
@@ -87,26 +134,15 @@ impl Worker {
 
                 // if it's a target kill, handle it now
                 if let Some(id) = courier.target.take() {
-                    if id == 0 {
-                        // all clear signal, remove self from both lists
-                        if let Ok(mut g) = graveyard.write() {
-                            g.clear();
-                            g.insert(0);
+                    if let Ok(mut g) = graveyard.write() {
+                        // otherwise, update the graveyard
+                        if id < g.len() {
+                            g[id] = -1;
                         }
 
-                        return;
-                    } else if id == my_id {
-                        // rare case, where the worker happen to pick up the message
-                        // to kill self, then do it
-                        if let Ok(mut g) = graveyard.write() {
-                            g.remove(&my_id);
-                        }
-
-                        return;
-                    } else {
-                        // async kill signal, update the lists with the target id
-                        if let Ok(mut g) = graveyard.write() {
-                            g.insert(id);
+                        if (id == 0 && ThreadPool::is_forced_close()) || id == my_id {
+                            // if my id or a forced kill, just quit
+                            return;
                         }
                     }
                 }
@@ -114,39 +150,14 @@ impl Worker {
                 // if idled longer than the expected worker life for unprivileged workers,
                 // then we're done now -- self-purging.
                 if let Some(idle) = idle.take() {
-                    if let Ok(expected_life) = life.read() {
-                        if *expected_life > Duration::from_millis(0) && idle > *expected_life {
-                            // in case the worker is also to be killed.
-                            if let Ok(mut g) = graveyard.write() {
-                                g.remove(&my_id);
-                            }
-
+                    if let Ok(max) = max_idle.read() {
+                        if max.gt(&Duration::from_millis(0)) && max.le(&idle) {
                             return;
                         }
                     }
                 }
             }
-        });
-
-        Worker {
-            id: my_id,
-            thread: Some(thread),
-        }
-    }
-
-    pub(crate) fn get_id(&self) -> usize {
-        self.id
-    }
-
-    // Calling `retire` on a worker will block the thread until the worker has done its work, or wake
-    // up from hibernation. This could block the caller for an undetermined amount of time.
-    pub(crate) fn retire(&mut self) {
-        if let Some(thread) = self.thread.take() {
-            // make sure the work is done
-            thread.join().unwrap_or_else(|err| {
-                eprintln!("Unable to drop worker: {}, error: {:?}", self.id, err);
-            });
-        }
+        })
     }
 
     fn check_queues(
@@ -271,10 +282,18 @@ impl Worker {
 
 impl Drop for Worker {
     fn drop(&mut self) {
+        if let Some(behavior) = self.before_drop {
+            behavior(self.id);
+        }
+
         if is_debug_mode() {
             println!("Dropping worker {}", self.id);
         }
 
         self.retire();
+
+        if let Some(behavior) = self.after_drop {
+            behavior(self.id);
+        }
     }
 }

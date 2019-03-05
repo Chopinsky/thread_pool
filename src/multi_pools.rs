@@ -40,10 +40,16 @@ impl Drop for PoolStore {
 }
 
 #[inline]
-pub fn initialize<S>(keys: HashMap<String, usize, S>)
+pub fn initialize<S>(keys: std::collections::HashMap<String, usize, S>)
     where S: std::hash::BuildHasher
 {
-    initialize_with_auto_adjustment(keys, None);
+    // copy to more efficient structure
+    let mut map = HashMap::with_capacity(keys.len());
+    for (k, v) in keys.into_iter() {
+        map.entry(k).or_insert(v);
+    }
+
+    initialize_with_auto_adjustment(map, None);
 }
 
 pub fn initialize_with_auto_adjustment<S>(keys: HashMap<String, usize, S>, period: Option<Duration>)

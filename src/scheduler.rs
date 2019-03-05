@@ -237,6 +237,7 @@ impl PoolManager for ThreadPool {
             return;
         }
 
+        // manager will update the graveyard
         self.manager.extend_by(more, &self.chan.1, &self.priority_chan.1);
     }
 
@@ -245,12 +246,8 @@ impl PoolManager for ThreadPool {
             return;
         }
 
-        for worker in self.manager.shrink_by(less) {
-            // send the termination message -- async kill as this is not an urgent task
-            if self.priority_chan.0.send(Message::Terminate(worker.get_id())).is_err() && is_debug_mode() {
-                eprintln!("Failed to send the termination message to worker: {}", worker.get_id());
-            }
-        }
+        // manager will update the graveyard
+        self.manager.shrink_by(less);
     }
 
     fn resize(&mut self, total: usize) {
@@ -286,7 +283,7 @@ impl PoolManager for ThreadPool {
     }
 
     fn kill_worker(&mut self, id: usize) {
-        if !self.manager.dismiss_worker(id) {
+        if self.manager.dismiss_worker(id).is_none() {
             // can't find the worker with the given id, quit now.
             return;
         }
