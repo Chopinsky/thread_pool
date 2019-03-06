@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use crossbeam_channel as channel;
 use crossbeam_channel::{Receiver, Sender, SendError, SendTimeoutError};
+use crate::config::{Config, ConfigStatus};
 use crate::debug::is_debug_mode;
 use crate::model::*;
 use crate::manager::*;
@@ -33,6 +34,10 @@ pub struct ThreadPool {
 
 impl ThreadPool {
     pub fn new(size: usize) -> ThreadPool {
+        Self::new_with_config(size, Config::default())
+    }
+
+    pub fn new_with_config(size: usize, config: Config) -> ThreadPool {
         let pool_size = match size {
             _ if size < 1 => 1,
             _ if size > THRESHOLD => THRESHOLD,
@@ -42,7 +47,8 @@ impl ThreadPool {
         let (sender, receiver) = channel::bounded(CHAN_CAP);
         let (pri_rx, pri_tx) = channel::bounded(CHAN_CAP);
 
-        let manager = Manager::new(pool_size, &receiver, &pri_tx);
+        let manager =
+            Manager::new_with_behavior(pool_size, &receiver, &pri_tx, config.worker_behavior());
 
         ThreadPool {
             init_size: pool_size,

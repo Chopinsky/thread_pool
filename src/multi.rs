@@ -5,6 +5,7 @@ use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
 use hashbrown::{HashMap, HashSet};
+use crate::config::{Config, ConfigStatus};
 use crate::scheduler::{PoolManager, PoolState, ThreadPool};
 use crate::debug::is_debug_mode;
 
@@ -43,16 +44,18 @@ impl Drop for PoolStore {
 pub fn initialize<S>(keys: std::collections::HashMap<String, usize, S>)
     where S: std::hash::BuildHasher
 {
-    // copy to more efficient structure
-    let mut map = HashMap::with_capacity(keys.len());
-    for (k, v) in keys.into_iter() {
-        map.entry(k).or_insert(v);
-    }
-
-    initialize_with_auto_adjustment(map, None);
+    init_with_config(keys, Config::default());
 }
 
-pub fn initialize_with_auto_adjustment<S>(keys: HashMap<String, usize, S>, period: Option<Duration>)
+pub fn initialize_with_auto_adjustment<S>(keys: std::collections::HashMap<String, usize, S>, period: Option<Duration>)
+    where S: std::hash::BuildHasher
+{
+    let mut config = Config::default();
+    config.set_refresh_period(period);
+    init_with_config(keys, config);
+}
+
+pub fn init_with_config<S>(keys: std::collections::HashMap<String, usize, S>, config: Config)
     where S: std::hash::BuildHasher
 {
     if keys.is_empty() {
@@ -61,8 +64,14 @@ pub fn initialize_with_auto_adjustment<S>(keys: HashMap<String, usize, S>, perio
 
     assert!(!PoolStore::is_some(), "You are trying to initialize the thread pools multiple times!");
 
+    // copy to more efficient structure
+    let mut map = HashMap::with_capacity(keys.len());
+    for (k, v) in keys.into_iter() {
+        map.entry(k).or_insert(v);
+    }
+
     ONCE.call_once(|| {
-        create(keys, period);
+        create(map, config);
     });
 }
 
@@ -166,7 +175,7 @@ pub fn add_pool(key: String, size: usize) -> Option<JoinHandle<()>> {
     Some(handler)
 }
 
-fn create<S>(keys: HashMap<String, usize, S>, period: Option<Duration>)
+fn create<S>(keys: HashMap<String, usize, S>, config: Config)
     where S: std::hash::BuildHasher
 {
     let size = keys.len();
@@ -177,7 +186,7 @@ fn create<S>(keys: HashMap<String, usize, S>, period: Option<Duration>)
             continue;
         }
 
-        store.entry(key).or_insert_with(|| ThreadPool::new(size));
+        store.entry(key).or_insert_with(|| ThreadPool::new_with_config(size, config.clone()));
     }
 
     unsafe {
@@ -185,7 +194,7 @@ fn create<S>(keys: HashMap<String, usize, S>, period: Option<Duration>)
         MULTI_POOL = Some(PoolStore {
             store,
             closing: false,
-            auto_adjust_period: period,
+            auto_adjust_period: config.refresh_period(),
             auto_adjust_handler: None,
             auto_adjust_register: HashSet::with_capacity(size),
         });

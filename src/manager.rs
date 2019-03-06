@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use std::vec;
@@ -8,22 +10,23 @@ use crate::worker::Worker;
 
 pub(crate) struct Manager {
     workers: Vec<Worker>,
-    last_id: usize,
+    last_worker_id: usize,
     graveyard: Arc<RwLock<Vec<i8>>>,
     max_idle: Arc<RwLock<Duration>>,
     status_behavior: StatusBehaviors,
 }
 
 impl Manager {
+    #[inline]
     pub(crate) fn new(range: usize, rx: &Receiver<Message>, pri_rx: &Receiver<Message>) -> Manager {
-        Self::new_with_behavior(range, rx, pri_rx, None)
+        Self::new_with_behavior(range, rx, pri_rx, StatusBehaviors::default())
     }
 
     pub(crate) fn new_with_behavior(
         range: usize,
         rx: &Receiver<Message>,
         pri_rx: &Receiver<Message>,
-        behavior: Option<StatusBehaviors>,
+        behavior: StatusBehaviors,
     ) -> Manager
     {
         let mut workers = Vec::with_capacity(range);
@@ -31,12 +34,6 @@ impl Manager {
 
         let graveyard =
             Arc::new(RwLock::new(vec::from_elem(0i8, range + 1)));
-
-        let status_behavior = if let Some(b) = behavior {
-            b
-        } else {
-            StatusBehaviors::default()
-        };
 
         (1..=range).for_each(|id| {
             workers.push(Worker::new(
@@ -46,7 +43,7 @@ impl Manager {
                 Arc::clone(&graveyard),
                 Arc::clone(&max_idle),
                 true,
-                &status_behavior
+                &behavior
             ));
         });
 
@@ -56,10 +53,10 @@ impl Manager {
 
         Manager {
             workers,
-            last_id: range,
+            last_worker_id: range,
             graveyard,
             max_idle,
-            status_behavior,
+            status_behavior: behavior,
         }
     }
 
@@ -105,7 +102,7 @@ impl Manager {
 
             if idx > 0 && idx < g.len() {
                 g.truncate(idx + 1);  // index is 0-based, so length should be +1.
-                self.last_id = idx;
+                self.last_worker_id = idx;
             }
         }
     }
@@ -147,7 +144,7 @@ impl WorkerManagement for Manager {
         (1..=more).for_each(|offset| {
             // Worker is created to subscribe, but would register self later when pulled from the
             // workers queue
-            let id = self.last_id + offset;
+            let id = self.last_worker_id + offset;
 
             self.workers
                 .push(Worker::new(
@@ -166,7 +163,7 @@ impl WorkerManagement for Manager {
             g.extend(vec::from_elem(0, more));
         }
 
-        self.last_id += more;
+        self.last_worker_id += more;
     }
 
     fn shrink_by(&mut self, less: usize) -> Vec<Worker> {
@@ -236,7 +233,8 @@ impl Drop for Manager {
     }
 }
 
-pub(crate) struct StatusBehaviors {
+#[derive(Clone)]
+pub struct StatusBehaviors {
     before_start: Option<WorkerUpdate>,
     after_start: Option<WorkerUpdate>,
     before_drop: Option<WorkerUpdate>,
@@ -254,7 +252,7 @@ impl StatusBehaviors {
     }
 }
 
-trait StatusBehaviorSetter {
+pub trait StatusBehaviorSetter {
     fn set_before_start(&mut self, behavior: WorkerUpdate);
     fn set_after_start(&mut self, behavior: WorkerUpdate);
     fn set_before_drop(&mut self, behavior: WorkerUpdate);

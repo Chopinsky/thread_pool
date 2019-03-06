@@ -1,11 +1,12 @@
 #![allow(dead_code)]
 
-use crate::scheduler::{PoolManager, ThreadPool};
-use crate::debug::is_debug_mode;
 use std::sync::{Once, ONCE_INIT};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
+use crate::config::{Config, ConfigStatus};
+use crate::debug::is_debug_mode;
+use crate::scheduler::{PoolManager, ThreadPool};
 
 static ONCE: Once = ONCE_INIT;
 static mut POOL: Option<Pool> = None;
@@ -49,10 +50,16 @@ impl Drop for Pool {
 
 #[inline]
 pub fn initialize(size: usize) {
-    initialize_with_auto_adjustment(size, None);
+    init_with_config(size, Config::default());
 }
 
 pub fn initialize_with_auto_adjustment(size: usize, period: Option<Duration>) {
+    let mut config = Config::default();
+    config.set_refresh_period(period);
+    init_with_config(size, config);
+}
+
+pub fn init_with_config(size: usize, config: Config) {
     assert!(!Pool::is_some(), "You are trying to initialize the thread pools multiple times!");
 
     let pool_size = match size {
@@ -61,7 +68,7 @@ pub fn initialize_with_auto_adjustment(size: usize, period: Option<Duration>) {
     };
 
     ONCE.call_once(|| {
-        create(pool_size, period);
+        create(pool_size, config);
     });
 }
 
@@ -116,7 +123,7 @@ pub fn resize(size: usize) -> JoinHandle<()> {
             return;
         }
 
-        create(size, None);
+        create(size, Config::default());
     })
 }
 
@@ -183,24 +190,25 @@ fn stop_auto_adjustment(pool: &mut Pool) {
     }
 }
 
-fn create(size: usize, auto_adjustment: Option<Duration>) {
+fn create(size: usize, config: Config) {
     if size == 0 {
         return;
     }
 
-    let (auto_mode, handler) = if let Some(period) = auto_adjustment {
-        (true, Some(start_auto_adjustment(period)))
-    } else {
-        (false, None)
-    };
+    let (auto_mode, handler) =
+        if let Some(period) = config.refresh_period() {
+            (true, Some(start_auto_adjustment(period)))
+        } else {
+            (false, None)
+        };
 
     // Make the pool
-    let mut store = ThreadPool::new(size);
+    let mut store = ThreadPool::new_with_config(size, config);
     store.toggle_auto_scale(auto_mode);
 
     // Put it in the heap so it can outlive this call
     unsafe {
-        POOL = Some(Pool {
+        POOL.replace(Pool {
             store,
             closing: false,
             auto_mode,
