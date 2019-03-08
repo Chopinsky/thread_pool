@@ -10,6 +10,41 @@ use crate::scheduler::ThreadPool;
 const TIMEOUT: Duration = Duration::from_micros(16);
 const LONG_TIMEOUT: Duration = Duration::from_micros(96);
 
+pub(crate) struct WorkerConfig {
+    name: Option<String>,
+    stack_size: usize,
+    privileged: bool,
+    max_idle: Arc<RwLock<Duration>>,
+}
+
+impl WorkerConfig {
+    pub(crate) fn new(
+        name: Option<String>,
+        stack_size: usize,
+        privileged: bool,
+        max_idle: Arc<RwLock<Duration>>
+    ) -> Self
+    {
+        WorkerConfig {
+            name,
+            stack_size,
+            privileged,
+            max_idle,
+        }
+    }
+}
+
+impl Default for WorkerConfig {
+    fn default() -> Self {
+        Self::new(
+            None,
+            0,
+            false,
+            Arc::new(RwLock::new(Duration::from_secs(0))))
+
+    }
+}
+
 pub(crate) struct Worker {
     id: usize,
     thread: Option<thread::JoinHandle<()>>,
@@ -30,15 +65,14 @@ impl Worker {
         rx: channel::Receiver<Message>,
         pri_rx: channel::Receiver<Message>,
         graveyard: Arc<RwLock<Vec<i8>>>,
-        max_idle: Arc<RwLock<Duration>>,
-        privileged: bool,
+        config: WorkerConfig,
         behavior_definition: &StatusBehaviors,
     ) -> Worker
     {
         behavior_definition.before_start(my_id);
 
         let thread: thread::JoinHandle<()> =
-            Self::run(my_id, rx, pri_rx, graveyard, max_idle, privileged);
+            Self::run(my_id, rx, pri_rx, graveyard, config);
 
         behavior_definition.after_start(my_id);
 
@@ -70,17 +104,26 @@ impl Worker {
         rx: channel::Receiver<Message>,
         pri_rx: channel::Receiver<Message>,
         graveyard: Arc<RwLock<Vec<i8>>>,
-        max_idle: Arc<RwLock<Duration>>,
-        privileged: bool
+        mut config: WorkerConfig,
     ) -> thread::JoinHandle<()>
     {
-        thread::spawn(move || {
+        let mut builder = thread::Builder::new();
+
+        if config.name.is_some() {
+            builder = builder.name(config.name.take().unwrap_or(String::new()));
+        }
+
+        if config.stack_size > 0 {
+            builder = builder.stack_size(config.stack_size);
+        }
+
+        builder.spawn(move || {
             let mut courier = WorkCourier {
                 target: None,
                 work: None,
             };
 
-            let mut since = if privileged {
+            let mut since = if config.privileged {
                 None
             } else {
                 Some(SystemTime::now())
@@ -150,14 +193,14 @@ impl Worker {
                 // if idled longer than the expected worker life for unprivileged workers,
                 // then we're done now -- self-purging.
                 if let Some(idle) = idle.take() {
-                    if let Ok(max) = max_idle.read() {
+                    if let Ok(max) = config.max_idle.read() {
                         if max.gt(&Duration::from_millis(0)) && max.le(&idle) {
                             return;
                         }
                     }
                 }
             }
-        })
+        }).unwrap()
     }
 
     fn check_queues(

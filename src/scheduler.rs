@@ -48,7 +48,9 @@ impl ThreadPool {
         let (pri_rx, pri_tx) = channel::bounded(CHAN_CAP);
 
         let manager =
-            Manager::new_with_behavior(pool_size, &receiver, &pri_tx, config.worker_behavior());
+            Manager::new_with_behavior(
+                None,pool_size, &receiver, &pri_tx, config.worker_behavior()
+            );
 
         ThreadPool {
             init_size: pool_size,

@@ -6,9 +6,10 @@ use std::vec;
 use crossbeam_channel::Receiver;
 use crate::debug::is_debug_mode;
 use crate::model::{Message, WorkerUpdate};
-use crate::worker::Worker;
+use crate::worker::{Worker, WorkerConfig};
 
 pub(crate) struct Manager {
+    name: Option<String>,
     workers: Vec<Worker>,
     last_worker_id: usize,
     graveyard: Arc<RwLock<Vec<i8>>>,
@@ -18,11 +19,12 @@ pub(crate) struct Manager {
 
 impl Manager {
     #[inline]
-    pub(crate) fn new(range: usize, rx: &Receiver<Message>, pri_rx: &Receiver<Message>) -> Manager {
-        Self::new_with_behavior(range, rx, pri_rx, StatusBehaviors::default())
+    pub(crate) fn new(name: Option<String>, range: usize, rx: &Receiver<Message>, pri_rx: &Receiver<Message>) -> Manager {
+        Self::new_with_behavior(name, range, rx, pri_rx, StatusBehaviors::default())
     }
 
     pub(crate) fn new_with_behavior(
+        name: Option<String>,
         range: usize,
         rx: &Receiver<Message>,
         pri_rx: &Receiver<Message>,
@@ -36,13 +38,21 @@ impl Manager {
             Arc::new(RwLock::new(vec::from_elem(0i8, range + 1)));
 
         (1..=range).for_each(|id| {
+            let worker_name = name.as_ref().and_then(|name| {
+                Some(format!("{}-{}", name, id))
+            });
+
             workers.push(Worker::new(
                 id,
                 rx.clone(),
                 pri_rx.clone(),
                 Arc::clone(&graveyard),
-                Arc::clone(&max_idle),
-                true,
+                WorkerConfig::new(
+                    worker_name,
+                    0,
+                    true,
+                    Arc::clone(&max_idle)
+                ),
                 &behavior
             ));
         });
@@ -52,6 +62,7 @@ impl Manager {
         }
 
         Manager {
+            name,
             workers,
             last_worker_id: range,
             graveyard,
@@ -145,6 +156,9 @@ impl WorkerManagement for Manager {
             // Worker is created to subscribe, but would register self later when pulled from the
             // workers queue
             let id = self.last_worker_id + offset;
+            let worker_name = self.name.as_ref().and_then(|name| {
+                Some(format!("{}-{}", name, id))
+            });
 
             self.workers
                 .push(Worker::new(
@@ -152,8 +166,9 @@ impl WorkerManagement for Manager {
                     receiver.clone(),
                     priority_receiver.clone(),
                     Arc::clone(&self.graveyard),
-                    Arc::clone(&self.max_idle),
-                    false,
+                    WorkerConfig::new(
+                        worker_name, 0, false, Arc::clone(&self.max_idle)
+                    ),
                     &self.status_behavior
                 ));
         });
