@@ -1,9 +1,10 @@
 #![allow(dead_code)]
 
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
 use std::vec;
+
 use crossbeam_channel::Receiver;
+use parking_lot::RwLock;
 use crate::debug::is_debug_mode;
 use crate::model::{Message, WorkerUpdate};
 use crate::worker::{Worker, WorkerConfig};
@@ -13,7 +14,7 @@ pub(crate) struct Manager {
     workers: Vec<Worker>,
     last_worker_id: usize,
     graveyard: Arc<RwLock<Vec<i8>>>,
-    max_idle: Arc<RwLock<Duration>>,
+    max_idle: Arc<AtomicUsize>,
     status_behavior: StatusBehaviors,
 }
 
@@ -32,7 +33,7 @@ impl Manager {
     ) -> Manager
     {
         let mut workers = Vec::with_capacity(range);
-        let max_idle = Arc::new(RwLock::new(Duration::from_millis(0)));
+        let max_idle = Arc::new(AtomicUsize::new(0));
 
         let graveyard =
             Arc::new(RwLock::new(vec::from_elem(0i8, range + 1)));
@@ -92,36 +93,36 @@ impl Manager {
     }
 
     fn mark_worker(&mut self, id: usize, status: i8) {
-        if let Ok(mut g) = self.graveyard.write() {
-            if id >= g.len() {
-                return;
-            }
-
-            g[id] = status;
+        let mut g = self.graveyard.write();
+        if id >= g.len() {
+            return;
         }
+
+        (*g)[id] = status;
     }
 
     fn graveyard_trim(&mut self) {
-        if let Ok(mut g) = self.graveyard.write() {
-            let mut idx = g.len();
-            while idx > 1 {
-                idx -= 1;
-                if g[idx] != -1 {
-                    break;
-                }
-            }
+        let g_read = self.graveyard.read();
 
-            if idx > 0 && idx < g.len() {
-                g.truncate(idx + 1);  // index is 0-based, so length should be +1.
-                self.last_worker_id = idx;
+        let mut idx = g_read.len();
+        while idx > 1 {
+            idx -= 1;
+            if g_read[idx] != -1 {
+                break;
             }
+        }
+
+        if idx > 0 && idx < g_read.len() {
+            let mut g_write = self.graveyard.write();
+            (*g_write).truncate(idx + 1);  // index is 0-based, so length should be +1.
+            self.last_worker_id = idx;
         }
     }
 }
 
 pub(crate) trait WorkerManagement {
     fn workers_count(&self) -> usize;
-    fn worker_auto_expire(&mut self, life: Duration);
+    fn worker_auto_expire(&mut self, life_in_millis: usize);
     fn extend_by(&mut self, more: usize, receiver: &Receiver<Message>, priority_receiver: &Receiver<Message>);
     fn shrink_by(&mut self, less:usize) -> Vec<Worker>;
     fn dismiss_worker(&mut self, id: usize) -> Option<Worker>;
@@ -135,12 +136,8 @@ impl WorkerManagement for Manager {
         self.workers.len()
     }
 
-    fn worker_auto_expire(&mut self, life: Duration) {
-        if let Ok(mut expected_life) = self.max_idle.write() {
-            if expected_life.ne(&life) {
-                *expected_life = life;
-            }
-        }
+    fn worker_auto_expire(&mut self, life_in_millis: usize) {
+        self.max_idle.swap(life_in_millis, Ordering::SeqCst);
     }
 
     fn extend_by(&mut self, more: usize, receiver: &Receiver<Message>, priority_receiver: &Receiver<Message>) {
@@ -173,9 +170,10 @@ impl WorkerManagement for Manager {
                 ));
         });
 
-        if let Ok(mut g) = self.graveyard.write() {
-            g.reserve_exact(more);
-            g.extend(vec::from_elem(0, more));
+        {
+            let mut g = self.graveyard.write();
+            (*g).reserve_exact(more);
+            (*g).extend(vec::from_elem(0, more));
         }
 
         self.last_worker_id += more;
@@ -189,13 +187,14 @@ impl WorkerManagement for Manager {
         let start = self.workers.len() - less;
         let workers: Vec<Worker> = self.workers.drain(start..).collect();
 
-        if let Ok(mut g) = self.graveyard.write() {
-            workers.iter().for_each(|w| {
-                let id = w.get_id();
+        {
+            let mut g = self.graveyard.write();
+            for worker in workers.iter(){
+                let id = worker.get_id();
                 if id < g.len() {
-                    g[id] = -1;
+                    (*g)[id] = -1;
                 }
-            });
+            }
         }
 
         // remove killed ids.

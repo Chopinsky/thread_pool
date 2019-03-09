@@ -1,7 +1,11 @@
-use std::sync::{Arc, RwLock};
+#![allow(dead_code)]
+
+use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
 use std::thread;
 use std::time::{Duration, SystemTime};
+
 use crossbeam_channel as channel;
+use parking_lot::RwLock;
 use crate::debug::is_debug_mode;
 use crate::manager::{StatusBehaviors, StatusBehaviorDefinitions};
 use crate::model::*;
@@ -14,7 +18,7 @@ pub(crate) struct WorkerConfig {
     name: Option<String>,
     stack_size: usize,
     privileged: bool,
-    max_idle: Arc<RwLock<Duration>>,
+    max_idle: Arc<AtomicUsize>,
 }
 
 impl WorkerConfig {
@@ -22,7 +26,7 @@ impl WorkerConfig {
         name: Option<String>,
         stack_size: usize,
         privileged: bool,
-        max_idle: Arc<RwLock<Duration>>
+        max_idle: Arc<AtomicUsize>
     ) -> Self
     {
         WorkerConfig {
@@ -32,6 +36,26 @@ impl WorkerConfig {
             max_idle,
         }
     }
+
+    pub(crate) fn stack_size(&mut self, size: usize) {
+        self.stack_size = size;
+    }
+
+    pub(crate) fn privileged(&mut self, is_privileged: bool) {
+        self.privileged = is_privileged;
+    }
+
+    pub(crate) fn name(&mut self, name: String) {
+        if name.is_empty() {
+            self.name = None;
+        } else {
+            self.name.replace(name);
+        }
+    }
+
+    pub(crate) fn max_idle(&mut self, idle: Arc<AtomicUsize>) {
+        self.max_idle = idle;
+    }
 }
 
 impl Default for WorkerConfig {
@@ -40,8 +64,8 @@ impl Default for WorkerConfig {
             None,
             0,
             false,
-            Arc::new(RwLock::new(Duration::from_secs(0))))
-
+            Arc::new(AtomicUsize::new(0))
+        )
     }
 }
 
@@ -117,13 +141,16 @@ impl Worker {
             builder = builder.stack_size(config.stack_size);
         }
 
+        let privileged = config.privileged;
+        let max_idle: Arc<AtomicUsize> = config.max_idle;
+
         builder.spawn(move || {
             let mut courier = WorkCourier {
                 target: None,
                 work: None,
             };
 
-            let mut since = if config.privileged {
+            let mut since = if privileged {
                 None
             } else {
                 Some(SystemTime::now())
@@ -135,7 +162,8 @@ impl Worker {
             // main worker loop
             loop {
                 // get ready to take new work from the channel
-                if let Ok(g) = graveyard.read() {
+                {
+                    let g = graveyard.read();
                     if my_id >= g.len() {
                         // illegal case, always return
                         return;
@@ -177,26 +205,25 @@ impl Worker {
 
                 // if it's a target kill, handle it now
                 if let Some(id) = courier.target.take() {
-                    if let Ok(mut g) = graveyard.write() {
-                        // otherwise, update the graveyard
-                        if id < g.len() {
-                            g[id] = -1;
-                        }
+                    let mut g = graveyard.write();
 
-                        if (id == 0 && ThreadPool::is_forced_close()) || id == my_id {
-                            // if my id or a forced kill, just quit
-                            return;
-                        }
+                    // otherwise, update the graveyard
+                    if id < g.len() {
+                        (*g)[id] = -1;
+                    }
+
+                    if (id == 0 && ThreadPool::is_forced_close()) || id == my_id {
+                        // if my id or a forced kill, just quit
+                        return;
                     }
                 }
 
                 // if idled longer than the expected worker life for unprivileged workers,
                 // then we're done now -- self-purging.
                 if let Some(idle) = idle.take() {
-                    if let Ok(max) = config.max_idle.read() {
-                        if max.gt(&Duration::from_millis(0)) && max.le(&idle) {
-                            return;
-                        }
+                    let max = Duration::from_millis(max_idle.load(Ordering::SeqCst) as u64);
+                    if max.gt(&Duration::from_millis(0)) && max.le(&idle) {
+                        return;
                     }
                 }
             }

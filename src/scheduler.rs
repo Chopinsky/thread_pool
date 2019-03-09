@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
 use crossbeam_channel as channel;
 use crossbeam_channel::{Receiver, Sender, SendError, SendTimeoutError};
 use crate::config::{Config, ConfigStatus};
@@ -282,9 +283,9 @@ impl PoolManager for ThreadPool {
     // Let extended workers to expire when idling for too long.
     fn auto_expire(&mut self, life: Option<Duration>) {
         let actual_life = if let Some(l) = life {
-            l
+            l.as_millis() as usize
         } else {
-            Duration::from_millis(0)
+            0usize
         };
 
         self.manager.worker_auto_expire(actual_life);

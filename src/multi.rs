@@ -1,10 +1,11 @@
 #![allow(dead_code)]
 
-use std::sync::{Once, ONCE_INIT};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
+
 use hashbrown::{HashMap, HashSet};
+use parking_lot::{Once, ONCE_INIT};
 use crate::config::{Config, ConfigStatus};
 use crate::scheduler::{PoolManager, PoolState, ThreadPool};
 use crate::debug::is_debug_mode;
