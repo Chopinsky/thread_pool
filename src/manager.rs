@@ -19,12 +19,7 @@ pub(crate) struct Manager {
 }
 
 impl Manager {
-    #[inline]
-    pub(crate) fn new(name: Option<String>, range: usize, rx: &Receiver<Message>, pri_rx: &Receiver<Message>) -> Manager {
-        Self::new_with_behavior(name, range, rx, pri_rx, StatusBehaviors::default())
-    }
-
-    pub(crate) fn new_with_behavior(
+    pub(crate) fn new(
         name: Option<String>,
         range: usize,
         rx: &Receiver<Message>,
@@ -326,11 +321,11 @@ impl StatusBehaviorDefinitions for StatusBehaviors {
     }
 
     fn before_drop_clone(&self) -> Option<WorkerUpdate> {
-        self.before_drop.clone()
+        self.before_drop
     }
 
     fn after_drop_clone(&self) -> Option<WorkerUpdate> {
-        self.after_drop.clone()
+        self.after_drop
     }
 }
 

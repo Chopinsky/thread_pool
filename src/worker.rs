@@ -13,6 +13,7 @@ use crate::scheduler::ThreadPool;
 
 const TIMEOUT: Duration = Duration::from_micros(16);
 const LONG_TIMEOUT: Duration = Duration::from_micros(96);
+const PARKING_CONSTANT: u8 = 3;
 
 pub(crate) struct WorkerConfig {
     name: Option<String>,
@@ -134,7 +135,7 @@ impl Worker {
         let mut builder = thread::Builder::new();
 
         if config.name.is_some() {
-            builder = builder.name(config.name.take().unwrap_or(String::new()));
+            builder = builder.name(config.name.take().unwrap_or_default());
         }
 
         if config.stack_size > 0 {
@@ -184,7 +185,7 @@ impl Worker {
 
                 // wait for work loop
                 if let Status(-1) =
-                Worker::check_queues(my_id, &pri_rx, &rx, &mut pri_work_count, &mut courier)
+                    Worker::check_queues(my_id, &pri_rx, &rx, &mut pri_work_count, &mut courier)
                 {
                     // if the channels are disconnected, return
                     return;
@@ -221,8 +222,8 @@ impl Worker {
                 // if idled longer than the expected worker life for unprivileged workers,
                 // then we're done now -- self-purging.
                 if let Some(idle) = idle.take() {
-                    let max = Duration::from_millis(max_idle.load(Ordering::SeqCst) as u64);
-                    if max.gt(&Duration::from_millis(0)) && max.le(&idle) {
+                    let max = max_idle.load(Ordering::Relaxed) as u128;
+                    if max.gt(&0) && max.le(&idle.as_millis()) {
                         return;
                     }
                 }
@@ -233,15 +234,17 @@ impl Worker {
     fn check_queues(
         id: usize,
         pri_chan: &channel::Receiver<Message>,
-        ord_chan: &channel::Receiver<Message>,
+        norm_chan: &channel::Receiver<Message>,
         pri_work_count: &mut u8,
         courier: &mut WorkCourier,
     ) -> Status
     {
-        // wait for work loop
+        // wait for work loop, 1/3 of workers will long-park for priority work, and 1/3 of workers
+        // will long-park for normal work, the remainder 1/3 workers will be fluid and constantly
+        // query both queues -- whichever yield a task, then it will execute that task.
         if *pri_work_count < 255 {
             // handle the priority queue if there're messages for work
-            let pri_work = if id % 4 == 0 {
+            let pri_work = if id % PARKING_CONSTANT == 0 {
                 // 1/3 of the workers would park for priority worker
                 pri_chan.recv_timeout(LONG_TIMEOUT)
             } else {
@@ -258,7 +261,7 @@ impl Worker {
                     if *pri_work_count < 4 {
                         // only add if we're below the continuous pri-work cap
                         *pri_work_count += 1;
-                    } else if ord_chan.is_full() {
+                    } else if norm_chan.is_full() {
                         // if we've done 4 or more priority work in a row, check if
                         // we should skip if the normal channel is full and maybe
                         // blocking, by setting the special number
@@ -283,15 +286,15 @@ impl Worker {
             *pri_work_count = 0;
         }
 
-        let ord_work = if id % 4 == 1 {
-            // 1/4 of the workers would always park for normal work
-            ord_chan.recv_timeout(LONG_TIMEOUT)
+        let norm_work = if id % PARKING_CONSTANT == 1 {
+            // 1/3 of the workers would always park for normal work
+            norm_chan.recv_timeout(LONG_TIMEOUT)
         } else {
             // otherwise, wait 16 us for work to come in.
-            ord_chan.recv_timeout(TIMEOUT)
+            norm_chan.recv_timeout(TIMEOUT)
         };
 
-        match ord_work {
+        match norm_work {
             Ok(message) => {
                 // message is the only place that can update the "done" field
                 Worker::unpack_message(message, courier);

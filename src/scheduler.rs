@@ -12,8 +12,7 @@ const RETRY_LIMIT: i8 = 4;
 const CHAN_CAP: usize = 16;
 const THRESHOLD: usize = 65535;
 const AUTO_EXTEND_TRIGGER_SIZE: usize = 2;
-
-static mut FORCE_CLOSE: AtomicBool = AtomicBool::new(false);
+static FORCE_CLOSE: AtomicBool = AtomicBool::new(false);
 
 pub enum ExecutionError {
     Timeout,
@@ -48,10 +47,13 @@ impl ThreadPool {
         let (sender, receiver) = channel::bounded(CHAN_CAP);
         let (pri_rx, pri_tx) = channel::bounded(CHAN_CAP);
 
-        let manager =
-            Manager::new_with_behavior(
-                None,pool_size, &receiver, &pri_tx, config.worker_behavior()
-            );
+        let manager = Manager::new(
+            config.pool_name(),
+            pool_size,
+            &receiver,
+            &pri_tx,
+            config.worker_behavior()
+        );
 
         ThreadPool {
             init_size: pool_size,
@@ -199,7 +201,7 @@ impl ThreadPool {
     }
 
     pub(crate) fn is_forced_close() -> bool {
-        unsafe { FORCE_CLOSE.load(Ordering::SeqCst) }
+        FORCE_CLOSE.load(Ordering::SeqCst)
     }
 }
 
@@ -326,7 +328,7 @@ impl PoolManager for ThreadPool {
     }
 
     fn force_close(&mut self) {
-        unsafe { FORCE_CLOSE.store(true, Ordering::SeqCst); }
+        FORCE_CLOSE.store(true, Ordering::SeqCst);
         self.close();
     }
 }
@@ -355,7 +357,7 @@ impl PoolState for ThreadPool {
 
     #[inline]
     fn get_priority_queue_length(&self) -> usize {
-            self.priority_chan.0.len()
+        self.priority_chan.0.len()
     }
 
     #[inline]
