@@ -13,7 +13,7 @@ use crate::scheduler::ThreadPool;
 
 const TIMEOUT: Duration = Duration::from_micros(16);
 const LONG_TIMEOUT: Duration = Duration::from_micros(96);
-const PARKING_CONSTANT: u8 = 3;
+const PARKING_CONSTANT: usize = 3;
 
 pub(crate) struct WorkerConfig {
     name: Option<String>,
