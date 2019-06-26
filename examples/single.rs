@@ -1,13 +1,14 @@
 extern crate threads_pool;
 
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use threads_pool::shared_mode;
 
 fn main() {
     shared_mode::initialize(4);
     let debug = true;
 
+    let now = Instant::now();
     for num in 0..=203 {
         println!("Sending job: {}...", num);
 
@@ -33,4 +34,7 @@ fn main() {
     println!("All jobs are sent...");
 
     shared_mode::close();
+
+    println!("Elapsed time: {} ms", now.elapsed().as_millis());
+    println!("Zero-cost time to be: {} ms", 204/4*100);
 }

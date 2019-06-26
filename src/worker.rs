@@ -13,7 +13,9 @@ use crate::scheduler::ThreadPool;
 
 const TIMEOUT: Duration = Duration::from_micros(16);
 const LONG_TIMEOUT: Duration = Duration::from_micros(96);
-const PARKING_CONSTANT: usize = 3;
+const LOT_COUNTS: usize = 3;
+const LONG_PARKING_ROUNDS: u8 = 16;
+const SHORT_PARKING_ROUNDS: u8 = 4;
 
 pub(crate) struct WorkerConfig {
     name: Option<String>,
@@ -243,17 +245,9 @@ impl Worker {
         // will long-park for normal work, the remainder 1/3 workers will be fluid and constantly
         // query both queues -- whichever yield a task, then it will execute that task.
         if *pri_work_count < 255 {
-            // handle the priority queue if there're messages for work
-            let pri_work = if id % PARKING_CONSTANT == 0 {
-                // 1/3 of the workers would park for priority worker
-                pri_chan.recv_timeout(LONG_TIMEOUT)
-            } else {
-                // otherwise, peek at the priority queue and move on to the normal queue
-                // for work that is immediately available
-                pri_chan.recv_timeout(TIMEOUT)
-            };
-
-            match pri_work {
+            // 1/3 of the workers is designated to wait longer for prioritised jobs
+            let parking = id % LOT_COUNTS == 0;
+            match Worker::fetch_work(pri_chan, norm_chan, parking, !parking) {
                 Ok(message) => {
                     // message is the only place that can update the "done" field
                     Worker::unpack_message(message, courier);
@@ -286,15 +280,8 @@ impl Worker {
             *pri_work_count = 0;
         }
 
-        let norm_work = if id % PARKING_CONSTANT == 1 {
-            // 1/3 of the workers would always park for normal work
-            norm_chan.recv_timeout(LONG_TIMEOUT)
-        } else {
-            // otherwise, wait 16 us for work to come in.
-            norm_chan.recv_timeout(TIMEOUT)
-        };
-
-        match norm_work {
+        // 1/3 of the workers is designated to wait longer for normal jobs
+        match Worker::fetch_work(norm_chan, pri_chan, id % LOT_COUNTS == 1, true) {
             Ok(message) => {
                 // message is the only place that can update the "done" field
                 Worker::unpack_message(message, courier);
@@ -312,6 +299,40 @@ impl Worker {
         };
 
         Status(0)
+    }
+
+    fn fetch_work(
+        main_chan: &channel::Receiver<Message>,
+        side_chan: &channel::Receiver<Message>,
+        parking: bool,
+        can_skip: bool
+    ) -> Result<Message, channel::RecvTimeoutError>
+    {
+        let mut wait = 0;
+        let rounds = if parking {
+            LONG_PARKING_ROUNDS
+        } else {
+            SHORT_PARKING_ROUNDS
+        };
+
+        loop {
+            wait += 1;
+
+            match main_chan.try_recv() {
+                Ok(work) => return Ok(work),
+                Err(channel::TryRecvError::Disconnected) => return Err(channel::RecvTimeoutError::Disconnected),
+                Err(channel::TryRecvError::Empty) => {
+                    if (can_skip || !parking) && !side_chan.is_empty() {
+                        // if there're normal work in queue, break to fetch the normal work
+                        return Err(channel::RecvTimeoutError::Timeout);
+                    }
+                },
+            }
+
+            if wait > rounds {
+                return Err(channel::RecvTimeoutError::Timeout);
+            }
+        }
     }
 
     fn handle_work(work: Option<Job>, since: &mut Option<SystemTime>) -> Option<Duration> {
