@@ -247,7 +247,9 @@ impl Worker {
         if *pri_work_count < 255 {
             // 1/3 of the workers is designated to wait longer for prioritised jobs
             let parking = id % LOT_COUNTS == 0;
-            match Worker::fetch_work(pri_chan, norm_chan, parking, !parking) {
+            match Worker::fetch_work(
+                pri_chan, norm_chan.is_empty(), !parking
+            ) {
                 Ok(message) => {
                     // message is the only place that can update the "done" field
                     Worker::unpack_message(message, courier);
@@ -281,7 +283,9 @@ impl Worker {
         }
 
         // 1/3 of the workers is designated to wait longer for normal jobs
-        match Worker::fetch_work(norm_chan, pri_chan, id % LOT_COUNTS == 1, true) {
+        match Worker::fetch_work(
+            norm_chan, pri_chan.is_empty(), id % LOT_COUNTS == 1
+        ) {
             Ok(message) => {
                 // message is the only place that can update the "done" field
                 Worker::unpack_message(message, courier);
@@ -303,16 +307,15 @@ impl Worker {
 
     fn fetch_work(
         main_chan: &channel::Receiver<Message>,
-        side_chan: &channel::Receiver<Message>,
-        parking: bool,
+        side_chan_empty: bool,
         can_skip: bool
     ) -> Result<Message, channel::RecvTimeoutError>
     {
         let mut wait = 0;
-        let rounds = if parking {
-            LONG_PARKING_ROUNDS
-        } else {
+        let rounds = if can_skip {
             SHORT_PARKING_ROUNDS
+        } else {
+            LONG_PARKING_ROUNDS
         };
 
         loop {
@@ -322,7 +325,7 @@ impl Worker {
                 Ok(work) => return Ok(work),
                 Err(channel::TryRecvError::Disconnected) => return Err(channel::RecvTimeoutError::Disconnected),
                 Err(channel::TryRecvError::Empty) => {
-                    if (can_skip || !parking) && !side_chan.is_empty() {
+                    if can_skip && !side_chan_empty {
                         // if there're normal work in queue, break to fetch the normal work
                         return Err(channel::RecvTimeoutError::Timeout);
                     }

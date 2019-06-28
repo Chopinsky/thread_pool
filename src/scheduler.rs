@@ -76,8 +76,8 @@ impl ThreadPool {
         self.auto_scale = auto_scale;
     }
 
-    pub fn exec<F: FnOnce() + Send + 'static>(
-        &mut self, f: F, prioritized: bool) -> Result<(), ExecutionError>
+    pub fn exec<F: FnOnce() + Send + 'static>(&mut self, f: F, prioritized: bool)
+        -> Result<(), ExecutionError>
     {
         let retry = if self.auto_scale {
             0
@@ -100,10 +100,12 @@ impl ThreadPool {
         }
     }
 
-    pub fn execute<F: FnOnce() + Send + 'static>(
-        &self, f: F) -> Result<(), ExecutionError>
+    pub fn execute<F: FnOnce() + Send + 'static>(&self, f: F)
+        -> Result<(), ExecutionError>
     {
-        match self.dispatch(Message::NewJob(Box::new(f)), -1, !self.priority_chan.0.is_full()) {
+        match self.dispatch(
+            Message::NewJob(Box::new(f)), -1, !self.priority_chan.0.is_full()
+        ) {
             Ok(_) => Ok(()),
             Err(SendTimeoutError::Timeout(_)) => Err(ExecutionError::Timeout),
             Err(SendTimeoutError::Disconnected(_)) => Err(ExecutionError::Disconnected),
@@ -133,7 +135,9 @@ impl ThreadPool {
         }
     }
 
-    fn dispatch(&self, message: Message, retry: i8, with_priority: bool) -> Result<bool, SendTimeoutError<Message>> {
+    fn dispatch(&self, message: Message, retry: i8, with_priority: bool)
+        -> Result<bool, SendTimeoutError<Message>>
+    {
         if self.closing {
             return Err(SendTimeoutError::Disconnected(message));
         }
