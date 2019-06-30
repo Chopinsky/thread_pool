@@ -4,6 +4,7 @@ use crate::model::WorkerUpdate;
 
 #[derive(Clone)]
 pub struct Config {
+    blocking: bool,
     pool_name: Option<String>,
     worker_behaviors: StatusBehaviors,
     refresh_period: Option<Duration>,
@@ -12,10 +13,15 @@ pub struct Config {
 impl Config {
     pub fn new() -> Self {
         Config {
+            blocking: false,
             pool_name: None,
             worker_behaviors: StatusBehaviors::default(),
             refresh_period: None,
         }
+    }
+
+    pub(crate) fn blocking(&self) -> bool {
+        self.blocking
     }
 }
 
@@ -32,6 +38,7 @@ pub trait ConfigStatus {
     fn set_pool_name(&mut self, name: String);
     fn set_refresh_period(&mut self, period: Option<Duration>);
     fn set_worker_behavior(&mut self, behavior: StatusBehaviors);
+    fn set_blocking(&mut self, blocking: bool);
 }
 
 impl ConfigStatus for Config {
@@ -61,6 +68,10 @@ impl ConfigStatus for Config {
 
     fn set_worker_behavior(&mut self, behavior: StatusBehaviors) {
         self.worker_behaviors = behavior
+    }
+
+    fn set_blocking(&mut self, blocking: bool) {
+        self.blocking = blocking;
     }
 }
 

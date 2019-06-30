@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crossbeam_channel as channel;
-use crossbeam_channel::{Sender, SendError, SendTimeoutError};
+use crossbeam_channel::{Sender, SendTimeoutError, TrySendError, SendError};
 use crate::config::{Config, ConfigStatus};
 use crate::debug::is_debug_mode;
 use crate::model::*;
@@ -22,14 +22,15 @@ pub enum ExecutionError {
 }
 
 pub struct ThreadPool {
-    init_size: usize,
     manager: Manager,
     chan: (Sender<Message>, Sender<Message>),
+    init_size: usize,
     upgrade_threshold: usize,
     auto_extend_threshold: usize,
     auto_scale: bool,
-    queue_timeout: Option<Duration>,
+    blocking: bool,
     closing: bool,
+    queue_timeout: Option<Duration>,
 }
 
 impl ThreadPool {
@@ -58,13 +59,14 @@ impl ThreadPool {
         );
 
         ThreadPool {
-            init_size: pool_size,
             manager,
             chan: (pri_tx, tx),
+            init_size: pool_size,
             upgrade_threshold: CHAN_CAP / 2,
             auto_extend_threshold: THRESHOLD,
-            auto_scale: false,
             queue_timeout: None,
+            auto_scale: false,
+            blocking: config.blocking(),
             closing: false,
         }
     }
@@ -78,23 +80,79 @@ impl ThreadPool {
         Self::new_with_config(size, config)
     }
 
+    /// Set the time out period for a job to be queued. If `timeout` is defined as some duration,
+    /// we will keep the new jobs in the queue for at least them amount of time when all workers of
+    /// the pool are busy. If it's set to `None` and all workers are busy at the moment a job comes,
+    /// we will either block the caller when pool's blocking setting is turned on, or return timeout
+    /// error immediately when the setting is turned off.
     pub fn set_exec_timeout(&mut self, timeout: Option<Duration>) {
         self.queue_timeout = timeout;
     }
 
+    /// Toggle if we should block the execution APIs when all workers are busy and we can't expand
+    /// the thread pool anymore for any reasons.
+    pub fn toggle_blocking(&mut self, blocking: bool) {
+        self.blocking = blocking;
+    }
+
+    /// Toggle if we can add temporary workers when the `ThreadPool` is under pressure. The temporary
+    /// works will retire after they have been idle for a period of time.
     pub fn toggle_auto_scale(&mut self, auto_scale: bool) {
         self.auto_scale = auto_scale;
     }
 
+    /// `exec` will dispatch a closure to a free thread to be executed. If no thread are free at the
+    /// moment and the pool setting allow adding new workers at pressure, some temporary workers will
+    /// be created and added to the pool for executing the accumulated pending jobs; otherwise, this
+    /// API will work the same way as the alternative: `execute`, that it will block the caller until
+    /// a worker becomes available, or the job queue timed out, where the job will be dropped and the
+    /// caller needs to send the job to queue for execution again, if it's needed.
+    ///
+    /// For highly competitive environments, such as using the pool to enable async operations for a
+    /// web server, disabling `auto_scale` could cause starvation deadlock. However, a server can only
+    /// have a limited resources for disposal, we can't create unlimited workers, there will be a
+    /// limit where we have to either choose to drop the job, or put it into a queue for later execution,
+    /// though that will mostly lie on caller's discretion.
+    ///
+    /// In addition, this API will take a `prioritized` parameter, which will allow more urgent job
+    /// to be taken by the workers sooner than jobs without a priority.
+    ///
+    /// Note that if the `ThreadPool` is created using delayed pool initialization, i.e. created using
+    /// either `lazy_create` or `lazy_create_with_config` APIs, then the pool will be initialized at
+    /// the first time a job is to be executed.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// extern crate threads_pool;
+    /// use threads_pool::ThreadPool;
+    /// use std::thread;
+    /// use std::time::Duration;
+    ///
+    /// let mut pool = ThreadPool::new(4);
+    ///
+    /// for id in 0..10 {
+    ///     pool.exec(|| {
+    ///         thread::sleep(Duration::from_secs(1));
+    ///         println!("thread {} has been waken after 1 seconds ... ", id);
+    ///     }, true);
+    /// }
+    /// ```
     pub fn exec<F: FnOnce() + Send + 'static>(&mut self, f: F, prioritized: bool)
         -> Result<(), ExecutionError>
     {
-        if self.manager.workers_count() == 0 && self.init_size > 0 {
-            // lazy init the pool at the first job
-            self.manager.add_workers(self.init_size);
-        } else {
-            // no worker to take the job
-            return Err(ExecutionError::Uninitialized);
+        if self.closing {
+            return Err(ExecutionError::Disconnected);
+        }
+
+        if self.manager.workers_count() == 0 {
+            if self.init_size > 0 {
+                // lazy init the pool at the first job, or regenerate workers when all are purged
+                self.manager.add_workers(self.init_size);
+            } else {
+                // no worker to take the job
+                return Err(ExecutionError::Uninitialized);
+            }
         }
 
         let retry = if self.auto_scale {
@@ -103,45 +161,47 @@ impl ThreadPool {
             -1
         };
         
-        match self.dispatch(Message::NewJob(Box::new(f)), retry, prioritized) {
-            Ok(was_busy) => {
-                if was_busy && self.auto_scale {
+        self.dispatch(Message::NewJob(Box::new(f)), retry, prioritized)
+            .map(|busy| {
+                if busy && self.auto_scale {
                     if let Some(target) = self.resize_target(self.init_size) {
                         self.resize(target);
                     }
                 }
-
-                Ok(())
-            },
-            Err(SendTimeoutError::Timeout(_)) => Err(ExecutionError::Timeout),
-            Err(SendTimeoutError::Disconnected(_)) => Err(ExecutionError::Disconnected),
-        }
+            })
+            .map_err(|err| {
+                match err {
+                    SendTimeoutError::Timeout(_) => ExecutionError::Timeout,
+                    SendTimeoutError::Disconnected(_) => ExecutionError::Disconnected,
+                }
+            })
     }
 
     pub fn execute<F: FnOnce() + Send + 'static>(&self, f: F)
         -> Result<(), ExecutionError>
     {
+        if self.closing {
+            return Err(ExecutionError::Disconnected);
+        }
+
         // no worker to take the job
         if self.manager.workers_count() < 1 {
             return Err(ExecutionError::Uninitialized);
         }
 
-        match self.dispatch(
-            Message::NewJob(Box::new(f)), -1, !self.chan.0.is_full()
-        ) {
-            Ok(_) => Ok(()),
-            Err(SendTimeoutError::Timeout(_)) => Err(ExecutionError::Timeout),
-            Err(SendTimeoutError::Disconnected(_)) => Err(ExecutionError::Disconnected),
-        }
+        self.dispatch(Message::NewJob(Box::new(f)), -1, !self.chan.0.is_full())
+            .map(|_| {})
+            .map_err(|err| {
+                match err {
+                    SendTimeoutError::Timeout(_) => ExecutionError::Timeout,
+                    SendTimeoutError::Disconnected(_) => ExecutionError::Disconnected,
+                }
+            })
     }
 
     fn dispatch(&self, message: Message, retry: i8, with_priority: bool)
         -> Result<bool, SendTimeoutError<Message>>
     {
-        if self.closing {
-            return Err(SendTimeoutError::Disconnected(message));
-        }
-
         let chan =
             if with_priority || (self.chan.1.is_empty() && self.chan.0.len() <= self.upgrade_threshold) {
                 // squeeze the work into the priority chan first even if some normal work is in queue
@@ -161,7 +221,7 @@ impl ThreadPool {
                     1
                 };
 
-                return match chan.send_timeout(message, factor * wait_period) {
+                match chan.send_timeout(message, factor * wait_period) {
                     Ok(()) => Ok(was_busy),
                     Err(SendTimeoutError::Disconnected(msg)) => Err(SendTimeoutError::Disconnected(msg)),
                     Err(SendTimeoutError::Timeout(msg)) => {
@@ -169,18 +229,27 @@ impl ThreadPool {
                             return Err(SendTimeoutError::Timeout(msg));
                         }
 
-                        return self.dispatch(msg, retry + 1, with_priority);
+                        self.dispatch(msg, retry + 1, with_priority)
                     },
-                };
+                }
             },
             None => {
-                if let Err(SendError(message)) = chan.send(message) {
-                    return Err(SendTimeoutError::Disconnected(message));
-                };
+                if self.blocking {
+                    // wait until a worker is ready to take new work
+                    match chan.send(message) {
+                        Ok(()) => Ok(was_busy),
+                        Err(SendError(msg)) => Err(SendTimeoutError::Disconnected(msg)),
+                    }
+                } else {
+                    // timeout immediately if all workers are busy
+                    match chan.try_send(message) {
+                        Ok(()) => Ok(was_busy),
+                        Err(TrySendError::Disconnected(msg)) => Err(SendTimeoutError::Disconnected(msg)),
+                        Err(TrySendError::Full(msg)) => Err(SendTimeoutError::Timeout(msg)),
+                    }
+                }
             }
         }
-
-        Ok(was_busy)
     }
 
     fn resize_target(&self, queue_length: usize) -> Option<usize> {
