@@ -16,54 +16,43 @@ pub(crate) struct Manager {
     graveyard: Arc<RwLock<Vec<i8>>>,
     max_idle: Arc<AtomicUsize>,
     status_behavior: StatusBehaviors,
+    chan: (Receiver<Message>, Receiver<Message>),
 }
 
 impl Manager {
     pub(crate) fn new(
         name: Option<String>,
         range: usize,
-        rx: &Receiver<Message>,
-        pri_rx: &Receiver<Message>,
+        pri_rx: Receiver<Message>,
+        rx: Receiver<Message>,
         behavior: StatusBehaviors,
     ) -> Manager
     {
-        let mut workers = Vec::with_capacity(range);
-        let max_idle = Arc::new(AtomicUsize::new(0));
-
-        let graveyard =
-            Arc::new(RwLock::new(vec::from_elem(0i8, range + 1)));
-
-        (1..=range).for_each(|id| {
-            let worker_name = name.as_ref().and_then(|name| {
-                Some(format!("{}-{}", name, id))
-            });
-
-            workers.push(Worker::new(
-                id,
-                rx.clone(),
-                pri_rx.clone(),
-                Arc::clone(&graveyard),
-                WorkerConfig::new(
-                    worker_name,
-                    0,
-                    true,
-                    Arc::clone(&max_idle)
-                ),
-                &behavior
-            ));
-        });
+        let mut m = Self::lazy_create(name, pri_rx, rx, behavior);
+        m.add_workers(range);
 
         if is_debug_mode() {
-            println!("Pool has been initialized with {} pools", workers.len());
+            println!("Pool has been initialized with {} pools", m.workers.len());
         }
 
+        m
+    }
+
+    pub(crate) fn lazy_create(
+        name: Option<String>,
+        pri_rx: Receiver<Message>,
+        rx: Receiver<Message>,
+        behavior: StatusBehaviors,
+    ) -> Manager
+    {
         Manager {
             name,
-            workers,
-            last_worker_id: range,
-            graveyard,
-            max_idle,
+            workers: Vec::new(),
+            last_worker_id: 0,
+            graveyard: Arc::new(RwLock::new(vec::from_elem(0i8, 1))),
+            max_idle: Arc::new(AtomicUsize::new(0)),
             status_behavior: behavior,
+            chan: (pri_rx, rx),
         }
     }
 
@@ -87,6 +76,56 @@ impl Manager {
         }
     }
 
+    pub(crate) fn add_workers(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+
+        if self.last_worker_id > 0 {
+            // remove killed ids.
+            self.graveyard_trim();
+        }
+
+        // reserve rooms for workers
+        self.workers.reserve(count);
+
+        // the start id is the next integer from the last worker's id
+        (1..=count).for_each(|offset| {
+            // Worker is created to subscribe, but would register self later when pulled from the
+            // workers queue
+            let id = self.last_worker_id + offset;
+            let worker_name = self.name.as_ref().and_then(|name| {
+                Some(format!("{}-{}", name, id))
+            });
+
+            let (rx, pri_rx) = (self.chan.0.clone(), self.chan.1.clone());
+
+            self.workers.push(
+                Worker::new(
+                    id,
+                    pri_rx,
+                    rx,
+                    Arc::clone(&self.graveyard),
+                    WorkerConfig::new(
+                        worker_name,
+                        0,
+                        false,
+                        Arc::clone(&self.max_idle),
+                    ),
+                    &self.status_behavior
+                )
+            );
+        });
+
+        {
+            let mut g = self.graveyard.write();
+            (*g).reserve(count);
+            (*g).extend(vec::from_elem(0, count));
+        }
+
+        self.last_worker_id += count;
+    }
+
     fn mark_worker(&mut self, id: usize, status: i8) {
         let mut g = self.graveyard.write();
         if id >= g.len() {
@@ -97,28 +136,36 @@ impl Manager {
     }
 
     fn graveyard_trim(&mut self) {
-        let g_read = self.graveyard.read();
+        let last = {
+            let g_read = self.graveyard.read();
+            let mut idx = g_read.len() - 1;
 
-        let mut idx = g_read.len();
-        while idx > 1 {
-            idx -= 1;
-            if g_read[idx] != -1 {
-                break;
+            if idx < 1 || g_read[idx] != -1 {
+                // nothing to trim (no worker or no died workers at the end of the queue), just return
+                return;
             }
-        }
 
-        if idx > 0 && idx < g_read.len() {
-            let mut g_write = self.graveyard.write();
-            (*g_write).truncate(idx + 1);  // index is 0-based, so length should be +1.
-            self.last_worker_id = idx;
-        }
+            while idx > 0 {
+                if g_read[idx] != -1 {
+                    break;
+                }
+
+                idx -= 1;
+            }
+
+            idx
+        };
+
+        let mut g_write = self.graveyard.write();
+        (*g_write).truncate(last + 1);  // index is 0-based, so length should be +1.
+        self.last_worker_id = last;
     }
 }
 
 pub(crate) trait WorkerManagement {
     fn workers_count(&self) -> usize;
     fn worker_auto_expire(&mut self, life_in_millis: usize);
-    fn extend_by(&mut self, more: usize, receiver: &Receiver<Message>, priority_receiver: &Receiver<Message>);
+    fn extend_by(&mut self, more: usize);
     fn shrink_by(&mut self, less:usize) -> Vec<Worker>;
     fn dismiss_worker(&mut self, id: usize) -> Option<Worker>;
     fn first_worker_id(&self) -> usize;
@@ -135,43 +182,8 @@ impl WorkerManagement for Manager {
         self.max_idle.swap(life_in_millis, Ordering::SeqCst);
     }
 
-    fn extend_by(&mut self, more: usize, receiver: &Receiver<Message>, priority_receiver: &Receiver<Message>) {
-        if more == 0 {
-            return;
-        }
-
-        // remove killed ids.
-        self.graveyard_trim();
-
-        // the start id is the next integer from the last worker's id
-        (1..=more).for_each(|offset| {
-            // Worker is created to subscribe, but would register self later when pulled from the
-            // workers queue
-            let id = self.last_worker_id + offset;
-            let worker_name = self.name.as_ref().and_then(|name| {
-                Some(format!("{}-{}", name, id))
-            });
-
-            self.workers
-                .push(Worker::new(
-                    id,
-                    receiver.clone(),
-                    priority_receiver.clone(),
-                    Arc::clone(&self.graveyard),
-                    WorkerConfig::new(
-                        worker_name, 0, false, Arc::clone(&self.max_idle)
-                    ),
-                    &self.status_behavior
-                ));
-        });
-
-        {
-            let mut g = self.graveyard.write();
-            (*g).reserve_exact(more);
-            (*g).extend(vec::from_elem(0, more));
-        }
-
-        self.last_worker_id += more;
+    fn extend_by(&mut self, more: usize) {
+        self.add_workers(more);
     }
 
     fn shrink_by(&mut self, less: usize) -> Vec<Worker> {

@@ -6,7 +6,7 @@ This package provides an easy way to create and manage thread pools, so you don'
 In your project's `Cargo.toml`, add dependency:
 ```cargo
 [dependencies]
-threads_pool = "^0.1.0"
+threads_pool = "^0.2.0"
 ```
 
 Then in your code: 

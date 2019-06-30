@@ -89,8 +89,8 @@ struct WorkCourier {
 impl Worker {
     pub(crate) fn new(
         my_id: usize,
-        rx: channel::Receiver<Message>,
         pri_rx: channel::Receiver<Message>,
+        rx: channel::Receiver<Message>,
         graveyard: Arc<RwLock<Vec<i8>>>,
         config: WorkerConfig,
         behavior_definition: &StatusBehaviors,

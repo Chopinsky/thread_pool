@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crossbeam_channel as channel;
-use crossbeam_channel::{Receiver, Sender, SendError, SendTimeoutError};
+use crossbeam_channel::{Sender, SendError, SendTimeoutError};
 use crate::config::{Config, ConfigStatus};
 use crate::debug::is_debug_mode;
 use crate::model::*;
@@ -16,6 +16,7 @@ static FORCE_CLOSE: AtomicBool = AtomicBool::new(false);
 
 pub enum ExecutionError {
     Timeout,
+    Uninitialized,
     Disconnected,
     PoolPoisoned,
 }
@@ -23,8 +24,7 @@ pub enum ExecutionError {
 pub struct ThreadPool {
     init_size: usize,
     manager: Manager,
-    chan: (Sender<Message>, Receiver<Message>),
-    priority_chan: (Sender<Message>, Receiver<Message>),
+    chan: (Sender<Message>, Sender<Message>),
     upgrade_threshold: usize,
     auto_extend_threshold: usize,
     auto_scale: bool,
@@ -33,10 +33,12 @@ pub struct ThreadPool {
 }
 
 impl ThreadPool {
+    /// Create a `ThreadPool` with default configurations
     pub fn new(size: usize) -> ThreadPool {
         Self::new_with_config(size, Config::default())
     }
 
+    /// Create a `ThreadPool` with supplied configurations
     pub fn new_with_config(size: usize, config: Config) -> ThreadPool {
         let pool_size = match size {
             _ if size < 1 => 1,
@@ -44,28 +46,36 @@ impl ThreadPool {
             _ => size,
         };
 
-        let (sender, receiver) = channel::bounded(CHAN_CAP);
-        let (pri_rx, pri_tx) = channel::bounded(CHAN_CAP);
+        let (tx, rx) = channel::bounded(CHAN_CAP);
+        let (pri_tx, pri_rx) = channel::bounded(CHAN_CAP);
 
         let manager = Manager::new(
             config.pool_name(),
             pool_size,
-            &receiver,
-            &pri_tx,
+            pri_rx,
+            rx,
             config.worker_behavior()
         );
 
         ThreadPool {
             init_size: pool_size,
             manager,
-            chan: (sender, receiver),
-            priority_chan: (pri_rx, pri_tx),
+            chan: (pri_tx, tx),
             upgrade_threshold: CHAN_CAP / 2,
             auto_extend_threshold: THRESHOLD,
             auto_scale: false,
             queue_timeout: None,
             closing: false,
         }
+    }
+
+    pub fn lazy_create(size: usize) -> ThreadPool {
+        Self::lazy_create_with_config(size, Config::default())
+    }
+
+    pub fn lazy_create_with_config(size: usize, config: Config) -> ThreadPool {
+        //TODO: replace with real impl ...
+        Self::new_with_config(size, config)
     }
 
     pub fn set_exec_timeout(&mut self, timeout: Option<Duration>) {
@@ -79,6 +89,14 @@ impl ThreadPool {
     pub fn exec<F: FnOnce() + Send + 'static>(&mut self, f: F, prioritized: bool)
         -> Result<(), ExecutionError>
     {
+        if self.manager.workers_count() == 0 && self.init_size > 0 {
+            // lazy init the pool at the first job
+            self.manager.add_workers(self.init_size);
+        } else {
+            // no worker to take the job
+            return Err(ExecutionError::Uninitialized);
+        }
+
         let retry = if self.auto_scale {
             0
         } else {
@@ -103,33 +121,15 @@ impl ThreadPool {
     pub fn execute<F: FnOnce() + Send + 'static>(&self, f: F)
         -> Result<(), ExecutionError>
     {
+        // no worker to take the job
+        if self.manager.workers_count() < 1 {
+            return Err(ExecutionError::Uninitialized);
+        }
+
         match self.dispatch(
-            Message::NewJob(Box::new(f)), -1, !self.priority_chan.0.is_full()
+            Message::NewJob(Box::new(f)), -1, !self.chan.0.is_full()
         ) {
             Ok(_) => Ok(()),
-            Err(SendTimeoutError::Timeout(_)) => Err(ExecutionError::Timeout),
-            Err(SendTimeoutError::Disconnected(_)) => Err(ExecutionError::Disconnected),
-        }
-    }
-
-    #[deprecated(
-        since = "0.1.10",
-        note = "Setup auto-scale using self.toggle_auto_scale(true), then call \
-                function self.exec(...) instead; this API will be removed in 0.2.0"
-    )]
-    pub fn execute_with_autoscale<F: FnOnce() + Send + 'static>(
-        &mut self, f: F) -> Result<(), ExecutionError>
-    {
-        match self.dispatch(Message::NewJob(Box::new(f)), 0, !self.priority_chan.0.is_full()) {
-            Ok(was_busy) => {
-                if was_busy {
-                    if let Some(target) = self.resize_target(self.init_size) {
-                        self.resize(target);
-                    }
-                }
-
-                Ok(())
-            },
             Err(SendTimeoutError::Timeout(_)) => Err(ExecutionError::Timeout),
             Err(SendTimeoutError::Disconnected(_)) => Err(ExecutionError::Disconnected),
         }
@@ -143,12 +143,12 @@ impl ThreadPool {
         }
 
         let chan =
-            if with_priority || (self.chan.0.is_empty() && self.priority_chan.0.len() <= self.upgrade_threshold) {
-                // squeeze the work into the priority chan first even if a normal work
-                &self.priority_chan.0
+            if with_priority || (self.chan.1.is_empty() && self.chan.0.len() <= self.upgrade_threshold) {
+                // squeeze the work into the priority chan first even if some normal work is in queue
+                &self.chan.0
             } else {
                 // normal work and then priority queue is full
-                &self.chan.0
+                &self.chan.1
             };
 
         let was_busy = chan.is_full();
@@ -253,7 +253,7 @@ impl PoolManager for ThreadPool {
         }
 
         // manager will update the graveyard
-        self.manager.extend_by(more, &self.chan.1, &self.priority_chan.1);
+        self.manager.extend_by(more);
     }
 
     fn shrink(&mut self, less: usize) {
@@ -303,7 +303,7 @@ impl PoolManager for ThreadPool {
             return;
         }
 
-        if self.priority_chan.0.send(Message::Terminate(id)).is_err() && is_debug_mode() {
+        if self.chan.0.send(Message::Terminate(id)).is_err() && is_debug_mode() {
             eprintln!("Failed to send the termination message to worker: {}", id);
         }
 
@@ -314,7 +314,7 @@ impl PoolManager for ThreadPool {
 
     fn clear(&mut self) {
         let mut sent = false;
-        if let Ok(()) = self.priority_chan.0.send(Message::Terminate(0)) {
+        if let Ok(()) = self.chan.0.send(Message::Terminate(0)) {
             sent = true;
         }
 
@@ -356,12 +356,12 @@ impl PoolState for ThreadPool {
 
     #[inline]
     fn get_queue_length(&self) -> usize {
-        self.chan.0.len()
+        self.chan.0.len() + self.chan.1.len()
     }
 
     #[inline]
     fn get_priority_queue_length(&self) -> usize {
-        self.priority_chan.0.len()
+        self.chan.0.len()
     }
 
     #[inline]
