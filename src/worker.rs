@@ -10,6 +10,7 @@ use crate::debug::is_debug_mode;
 use crate::manager::{StatusBehaviors, StatusBehaviorDefinitions};
 use crate::model::*;
 use crate::scheduler::ThreadPool;
+use hashbrown::HashSet;
 
 const TIMEOUT: Duration = Duration::from_micros(16);
 const LONG_TIMEOUT: Duration = Duration::from_micros(96);
@@ -91,21 +92,21 @@ impl Worker {
         my_id: usize,
         pri_rx: channel::Receiver<Message>,
         rx: channel::Receiver<Message>,
-        graveyard: Arc<RwLock<Vec<i8>>>,
+        graveyard: Arc<RwLock<HashSet<usize>>>,
         config: WorkerConfig,
         behavior_definition: &StatusBehaviors,
     ) -> Worker
     {
         behavior_definition.before_start(my_id);
 
-        let thread: thread::JoinHandle<()> =
-            Self::run(my_id, rx, pri_rx, graveyard, config);
+        let worker: thread::JoinHandle<()> =
+            Self::spawn_worker(my_id, rx, pri_rx, graveyard, config);
 
         behavior_definition.after_start(my_id);
 
         Worker {
             id: my_id,
-            thread: Some(thread),
+            thread: Some(worker),
             before_drop: behavior_definition.before_drop_clone(),
             after_drop: behavior_definition.after_drop_clone(),
         }
@@ -126,11 +127,11 @@ impl Worker {
         }
     }
 
-    fn run(
+    fn spawn_worker(
         my_id: usize,
         rx: channel::Receiver<Message>,
         pri_rx: channel::Receiver<Message>,
-        graveyard: Arc<RwLock<Vec<i8>>>,
+        graveyard: Arc<RwLock<HashSet<usize>>>,
         mut config: WorkerConfig,
     ) -> thread::JoinHandle<()>
     {
@@ -167,16 +168,12 @@ impl Worker {
                 // get ready to take new work from the channel
                 {
                     let g = graveyard.read();
-                    if my_id >= g.len() {
-                        // illegal case, always return
+
+                    if g.contains(&my_id) {
                         return;
                     }
 
-                    if g[my_id] == -1 {
-                        return;
-                    }
-
-                    if g[0] == -1
+                    if g.contains(&0)
                         && (ThreadPool::is_forced_close() || pri_rx.is_empty() && rx.is_empty())
                     {
                         // if shutting down, check if we can abandon all work by checking forced
@@ -208,15 +205,11 @@ impl Worker {
 
                 // if it's a target kill, handle it now
                 if let Some(id) = courier.target.take() {
-                    let mut g = graveyard.write();
+                    // update the graveyard
+                    graveyard.write().insert(id);
 
-                    // otherwise, update the graveyard
-                    if id < g.len() {
-                        (*g)[id] = -1;
-                    }
-
+                    // if my id or a forced kill, just quit
                     if (id == 0 && ThreadPool::is_forced_close()) || id == my_id {
-                        // if my id or a forced kill, just quit
                         return;
                     }
                 }
@@ -226,6 +219,8 @@ impl Worker {
                 if let Some(idle) = idle.take() {
                     let max = max_idle.load(Ordering::Relaxed) as u128;
                     if max.gt(&0) && max.le(&idle.as_millis()) {
+                        // mark self as a voluntary retiree
+                        graveyard.write().insert(my_id);
                         return;
                     }
                 }

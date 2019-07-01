@@ -1,9 +1,8 @@
 #![allow(dead_code)]
 
 use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
-use std::vec;
-
 use crossbeam_channel::Receiver;
+use hashbrown::HashSet;
 use parking_lot::RwLock;
 use crate::debug::is_debug_mode;
 use crate::model::{Message, WorkerUpdate};
@@ -13,7 +12,7 @@ pub(crate) struct Manager {
     name: Option<String>,
     workers: Vec<Worker>,
     last_worker_id: usize,
-    graveyard: Arc<RwLock<Vec<i8>>>,
+    graveyard: Arc<RwLock<HashSet<usize>>>,
     max_idle: Arc<AtomicUsize>,
     status_behavior: StatusBehaviors,
     chan: (Receiver<Message>, Receiver<Message>),
@@ -30,6 +29,7 @@ impl Manager {
     {
         let mut m = Self::lazy_create(name, pri_rx, rx, behavior);
         m.add_workers(range);
+        m.graveyard.write().reserve(range);
 
         if is_debug_mode() {
             println!("Pool has been initialized with {} pools", m.workers.len());
@@ -49,7 +49,7 @@ impl Manager {
             name,
             workers: Vec::new(),
             last_worker_id: 0,
-            graveyard: Arc::new(RwLock::new(vec::from_elem(0i8, 1))),
+            graveyard: Arc::new(RwLock::new(HashSet::new())),
             max_idle: Arc::new(AtomicUsize::new(0)),
             status_behavior: behavior,
             chan: (pri_rx, rx),
@@ -74,6 +74,9 @@ impl Manager {
                 self.status_behavior.after_drop(id);
             }
         }
+
+        // also clear the graveyard
+        self.graveyard.write().clear();
     }
 
     pub(crate) fn add_workers(&mut self, count: usize) {
@@ -119,46 +122,36 @@ impl Manager {
 
         {
             let mut g = self.graveyard.write();
-            (*g).reserve(count);
-            (*g).extend(vec::from_elem(0, count));
+            if g.capacity() - g.len() < count {
+                (*g).reserve(count);
+            }
         }
 
         self.last_worker_id += count;
     }
 
-    fn mark_worker(&mut self, id: usize, status: i8) {
-        let mut g = self.graveyard.write();
-        if id >= g.len() {
-            return;
-        }
-
-        (*g)[id] = status;
-    }
-
     fn graveyard_trim(&mut self) {
-        let last = {
-            let g_read = self.graveyard.read();
-            let mut idx = g_read.len() - 1;
+        let g = {
+            let mut g = self.graveyard.write();
 
-            if idx < 1 || g_read[idx] != -1 {
-                // nothing to trim (no worker or no died workers at the end of the queue), just return
+            if g.is_empty() {
                 return;
             }
 
-            while idx > 0 {
-                if g_read[idx] != -1 {
-                    break;
-                }
-
-                idx -= 1;
-            }
-
-            idx
+            g.drain().collect::<HashSet<usize>>()
         };
 
-        let mut g_write = self.graveyard.write();
-        (*g_write).truncate(last + 1);  // index is 0-based, so length should be +1.
-        self.last_worker_id = last;
+        let mut last = self.workers.len();
+        let mut index = 0;
+
+        while index < last {
+            if g.contains(&self.workers[index].get_id()) {
+                last -= 1;
+                self.workers.swap_remove(index);
+            }
+
+            index += 1;
+        }
     }
 }
 
@@ -196,16 +189,10 @@ impl WorkerManagement for Manager {
 
         {
             let mut g = self.graveyard.write();
-            for worker in workers.iter(){
-                let id = worker.get_id();
-                if id < g.len() {
-                    (*g)[id] = -1;
-                }
+            for worker in workers.iter() {
+                g.insert(worker.get_id());
             }
         }
-
-        // remove killed ids.
-        self.graveyard_trim();
 
         workers
     }
@@ -214,7 +201,7 @@ impl WorkerManagement for Manager {
         for idx in 0..self.workers.len() {
             if self.workers[idx].get_id() == id {
                 // swap out the worker, use swap_remove for better performance.
-                self.mark_worker(id, -1);
+                self.graveyard.write().insert(id);
                 return Some(self.workers.swap_remove(idx));
             }
         }
