@@ -77,6 +77,7 @@ impl Manager {
 
         // also clear the graveyard
         self.graveyard.write().clear();
+        self.last_worker_id = 0;
     }
 
     pub(crate) fn add_workers(&mut self, count: usize) {
@@ -85,7 +86,7 @@ impl Manager {
         }
 
         if self.last_worker_id > 0 {
-            // remove killed ids.
+            // before adding new workers, remove killed ones.
             self.graveyard_trim();
         }
 
@@ -120,13 +121,6 @@ impl Manager {
             );
         });
 
-        {
-            let mut g = self.graveyard.write();
-            if g.capacity() - g.len() < count {
-                (*g).reserve(count);
-            }
-        }
-
         self.last_worker_id += count;
     }
 
@@ -147,7 +141,10 @@ impl Manager {
         while index < last {
             if g.contains(&self.workers[index].get_id()) {
                 last -= 1;
-                self.workers.swap_remove(index);
+                if self.workers.swap_remove(index).get_id() == self.last_worker_id {
+                    // update the last worker id, since the last one has been released
+                    self.last_worker_id -= 1;
+                }
             }
 
             index += 1;
@@ -159,8 +156,8 @@ pub(crate) trait WorkerManagement {
     fn workers_count(&self) -> usize;
     fn worker_auto_expire(&mut self, life_in_millis: usize);
     fn extend_by(&mut self, more: usize);
-    fn shrink_by(&mut self, less:usize) -> Vec<Worker>;
-    fn dismiss_worker(&mut self, id: usize) -> Option<Worker>;
+    fn shrink_by(&mut self, less:usize) -> Vec<usize>;
+    fn dismiss_worker(&mut self, id: usize) -> Option<usize>;
     fn first_worker_id(&self) -> usize;
     fn last_worker_id(&self) -> usize;
     fn next_worker_id(&self, curr_id: usize) -> usize;
@@ -179,30 +176,23 @@ impl WorkerManagement for Manager {
         self.add_workers(more);
     }
 
-    fn shrink_by(&mut self, less: usize) -> Vec<Worker> {
+    fn shrink_by(&mut self, less: usize) -> Vec<usize> {
         if less == 0 {
             return Vec::new();
         }
 
         let start = self.workers.len() - less;
-        let workers: Vec<Worker> = self.workers.drain(start..).collect();
-
-        {
-            let mut g = self.graveyard.write();
-            for worker in workers.iter() {
-                g.insert(worker.get_id());
-            }
-        }
-
-        workers
+        self.workers
+            .drain(start..)
+            .map(|w| w.get_id())
+            .collect()
     }
 
-    fn dismiss_worker(&mut self, id: usize) -> Option<Worker> {
+    fn dismiss_worker(&mut self, id: usize) -> Option<usize> {
         for idx in 0..self.workers.len() {
             if self.workers[idx].get_id() == id {
                 // swap out the worker, use swap_remove for better performance.
-                self.graveyard.write().insert(id);
-                return Some(self.workers.swap_remove(idx));
+                return Some(self.workers.swap_remove(idx).get_id());
             }
         }
 

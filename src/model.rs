@@ -13,5 +13,5 @@ impl<F: FnOnce()> FnBox for F {
 
 pub(crate) enum Message {
     NewJob(Job),
-    Terminate(usize),
+    Terminate(Vec<usize>),
 }

@@ -83,7 +83,7 @@ pub(crate) struct Worker {
 struct Status(i8);
 
 struct WorkCourier {
-    target: Option<usize>,
+    target: Option<Vec<usize>>,
     work: Option<Job>,
 }
 
@@ -204,12 +204,26 @@ impl Worker {
                 //===========================
 
                 // if it's a target kill, handle it now
-                if let Some(id) = courier.target.take() {
+                if let Some(id_slice) = courier.target.take() {
                     // update the graveyard
-                    graveyard.write().insert(id);
+                    let mut found = false;
+                    let forced = ThreadPool::is_forced_close();
+
+                    if id_slice.len() == 1 {
+                        graveyard.write().insert(id_slice[0]);
+                        found = (id_slice[0] == 0 && forced) || id_slice[0] == my_id;
+                    } else if id_slice.len() > 1{
+                        let mut g = graveyard.write();
+                        for id in id_slice {
+                            g.insert(id);
+                            if !found {
+                                found = (id == 0 && forced) || id == my_id;
+                            }
+                        }
+                    }
 
                     // if my id or a forced kill, just quit
-                    if (id == 0 && ThreadPool::is_forced_close()) || id == my_id {
+                    if found {
                         return;
                     }
                 }

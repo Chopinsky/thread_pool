@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use std::vec;
 
 use crossbeam_channel as channel;
 use crossbeam_channel::{Sender, SendTimeoutError, TrySendError, SendError};
@@ -10,23 +11,53 @@ use crate::manager::*;
 
 const RETRY_LIMIT: i8 = 4;
 const CHAN_CAP: usize = 16;
-const THRESHOLD: usize = 65535;
+const THRESHOLD: usize = 1024;
 const AUTO_EXTEND_TRIGGER_SIZE: usize = 2;
 static FORCE_CLOSE: AtomicBool = AtomicBool::new(false);
 
+/// Enumeration to indicate possible reasons a job execution request is rejected. User will need to
+/// resubmit the job again, since closure's state may have been stale at the execution error.
 pub enum ExecutionError {
+    /// The job can't be executed because the queue is full when the new job is submitted and no new
+    /// worker becomes available before predetermined timeout period.
     Timeout,
+
+    /// The pool hasn't been initialized (i.e. lazy created), or all workers have been terminated, such
+    /// that there is no working threads to execute the job
     Uninitialized,
+
+    /// The pool is shutting down, or the internal pipeline is broken for whatever reasons.
     Disconnected,
+
+    /// Pool's internal states have been corrupted
     PoolPoisoned,
 }
 
 pub struct ThreadPool {
+    /// The worker manager struct, hide details of managing workers.
     manager: Manager,
+
+    /// The job queue deliverer. chan.0 is the priority channel, chan.1 is the normal channel.
     chan: (Sender<Message>, Sender<Message>),
+
+    /// Initial pool size. This will be used to create worker threads when the pool is lazy created,
+    /// among a few other things
     init_size: usize,
+
+    /// The threshold of which a job can be automatically upgraded to a prioritized job, if the
+    /// prioritized job queue has less jobs in queue than this threshold. This is mainly used to
+    /// boost the through out ratio if only a small potion of jobs have priorities, such that we
+    /// can make more workers busy though their life-time.
     upgrade_threshold: usize,
+
+    /// This is the threshold for the number of the threads that can be created for this pool. It's
+    /// default to 1024, but the threshold can be adjusted through the `set_queue_size_threshold` API.
     auto_extend_threshold: usize,
+
+    /// If we allow the pool to scale itself without explicitly API calls. If this option is turned
+    /// on, we will automatically add more workers to the reservoir when the pool is under pressure
+    /// (i.e. more submitted jobs in queue than workers can handle), These temp workers will stick
+    /// around for a while, and eventually retire after being idle for a period of time.
     auto_scale: bool,
     blocking: bool,
     closing: bool,
@@ -71,13 +102,66 @@ impl ThreadPool {
         }
     }
 
+    /// Create the `ThreadPool` with default pool configuration settings. When ready to activate the
+    /// pool, invoke the `activate_pool` API before submitting jobs for execution. You can also
+    /// call `exec` API to automatically activate the pool, however, calling the alternative immutable
+    /// API `execute` will always lead to an error.
     pub fn lazy_create(size: usize) -> ThreadPool {
         Self::lazy_create_with_config(size, Config::default())
     }
 
+    /// Create the `ThreadPool` with provided pool configuration settings. When ready to activate the
+    /// pool, invoke the `activate_pool` API before submitting jobs for execution. You can also
+    /// call `exec` API to automatically activate the pool, however, calling the alternative immutable
+    /// API `execute` will always lead to an error.
     pub fn lazy_create_with_config(size: usize, config: Config) -> ThreadPool {
         //TODO: replace with real impl ...
         Self::new_with_config(size, config)
+    }
+
+    /// If the pool is lazy created, user is responsible for activating the pool before submitting jobs
+    /// for execution. API `exec` will initialized the pool since it takes the mutable `self`, and hence
+    /// is able to initialize the pool. However, fail to explicitly initialize the pool could cause
+    /// unidentified behaviors.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// extern crate threads_pool;
+    /// use threads_pool::ThreadPool;
+    /// use std::thread;
+    /// use std::time::Duration;
+    ///
+    /// // lazy-create the pool
+    /// let mut pool = ThreadPool::lazy_create(4);
+    ///
+    /// // work on other stuff ...
+    /// thread::sleep(Duration::from_secs(4));
+    ///
+    /// // get ready to submit parallel jobs, first of all, activate the pool. Not that this step is
+    /// // optional if the caller will only use the `exec` API to submit jobs.
+    /// pool.activate_pool();
+    ///
+    /// // do parallel stuff.
+    /// for id in 0..10 {
+    ///     pool.exec(|| {
+    ///         thread::sleep(Duration::from_secs(1));
+    ///         println!("thread {} has been waken after 1 seconds ... ", id);
+    ///     }, true);
+    /// }
+    /// ```
+    pub fn activate_pool(&mut self) -> bool {
+        if self.closing || self.init_size == 0 {
+            return false;
+        }
+
+        let workers_count = self.manager.workers_count();
+        if workers_count < self.init_size {
+            // lazy init the pool at the first job, or regenerate workers when all are purged
+            self.manager.add_workers(self.init_size - workers_count);
+        }
+
+        true
     }
 
     /// Set the time out period for a job to be queued. If `timeout` is defined as some duration,
@@ -331,7 +415,10 @@ impl PoolManager for ThreadPool {
         }
 
         // manager will update the graveyard
-        self.manager.shrink_by(less);
+        let workers = self.manager.shrink_by(less);
+        if self.chan.0.send(Message::Terminate(workers)).is_err() && is_debug_mode() {
+            eprintln!("Failed to send the termination message to workers");
+        }
     }
 
     fn resize(&mut self, total: usize) {
@@ -372,7 +459,7 @@ impl PoolManager for ThreadPool {
             return;
         }
 
-        if self.chan.0.send(Message::Terminate(id)).is_err() && is_debug_mode() {
+        if self.chan.0.send(Message::Terminate(vec::from_elem(id, 1))).is_err() && is_debug_mode() {
             eprintln!("Failed to send the termination message to worker: {}", id);
         }
 
@@ -383,7 +470,7 @@ impl PoolManager for ThreadPool {
 
     fn clear(&mut self) {
         let mut sent = false;
-        if let Ok(()) = self.chan.0.send(Message::Terminate(0)) {
+        if let Ok(()) = self.chan.0.send(Message::Terminate(vec::from_elem(0, 1))) {
             sent = true;
         }
 
