@@ -41,12 +41,12 @@ impl WorkerConfig {
         }
     }
 
-    pub(crate) fn stack_size(&mut self, size: usize) {
+    pub(crate) fn set_stack_size(&mut self, size: usize) {
         self.stack_size = size;
     }
 
-    pub(crate) fn privileged(&mut self, is_privileged: bool) {
-        self.privileged = is_privileged;
+    pub(crate) fn set_privilege(&mut self, privileged: bool) {
+        self.privileged = privileged;
     }
 
     pub(crate) fn name(&mut self, name: String) {
@@ -80,14 +80,10 @@ pub(crate) struct Worker {
     after_drop: Option<WorkerUpdate>,
 }
 
-struct Status(i8);
-
-struct WorkCourier {
-    target: Option<Vec<usize>>,
-    work: Option<Job>,
-}
+struct WorkStatus(i8, Option<Job>, Option<Vec<usize>>);
 
 impl Worker {
+    /// Create and spawn the worker, this will dispatch the worker to listen to work queue immediately
     pub(crate) fn new(
         my_id: usize,
         pri_rx: channel::Receiver<Message>,
@@ -100,7 +96,7 @@ impl Worker {
         behavior_definition.before_start(my_id);
 
         let worker: thread::JoinHandle<()> =
-            Self::spawn_worker(my_id, rx, pri_rx, graveyard, config);
+            Self::spawn_worker(my_id, pri_rx, rx, graveyard, config);
 
         behavior_definition.after_start(my_id);
 
@@ -112,12 +108,13 @@ impl Worker {
         }
     }
 
+    /// Get the worker id
     pub(crate) fn get_id(&self) -> usize {
         self.id
     }
 
-    // Calling `retire` on a worker will block the thread until the worker has done its work, or wake
-    // up from hibernation. This could block the caller for an undetermined amount of time.
+    /// Calling `retire` on a worker will block the thread until the worker has done its work, or wake
+    /// up from hibernation. This could block the caller for an undetermined amount of time.
     pub(crate) fn retire(&mut self) {
         if let Some(thread) = self.thread.take() {
             // make sure the work is done
@@ -127,18 +124,28 @@ impl Worker {
         }
     }
 
+    /// If the worker has been put to sleep (i.e. in `park` mode), wake it up. This API will not check
+    /// if the worker is actually hibernating or not.
+    pub(crate) fn wake_up(&self) {
+        if let Some(t) = self.thread.as_ref() {
+            t.thread().unpark();
+        }
+    }
+
     fn spawn_worker(
         my_id: usize,
-        rx: channel::Receiver<Message>,
         pri_rx: channel::Receiver<Message>,
+        rx: channel::Receiver<Message>,
         graveyard: Arc<RwLock<HashSet<usize>>>,
-        mut config: WorkerConfig,
+        config: WorkerConfig,
     ) -> thread::JoinHandle<()>
     {
         let mut builder = thread::Builder::new();
 
         if config.name.is_some() {
-            builder = builder.name(config.name.take().unwrap_or_default());
+            builder = builder.name(
+                config.name.unwrap_or_else(|| format!("worker-{}", my_id))
+            );
         }
 
         if config.stack_size > 0 {
@@ -149,19 +156,13 @@ impl Worker {
         let max_idle: Arc<AtomicUsize> = config.max_idle;
 
         builder.spawn(move || {
-            let mut courier = WorkCourier {
-                target: None,
-                work: None,
-            };
-
+            let mut done: bool;
+            let mut pri_work_count: u8 = 0;
             let mut since = if privileged {
                 None
             } else {
                 Some(SystemTime::now())
             };
-
-            let mut idle: Option<Duration>;
-            let mut pri_work_count: u8 = 0;
 
             // main worker loop
             loop {
@@ -183,61 +184,72 @@ impl Worker {
                 }
 
                 // wait for work loop
-                if let Status(-1) =
-                    Worker::check_queues(my_id, &pri_rx, &rx, &mut pri_work_count, &mut courier)
-                {
-                    // if the channels are disconnected, return
+                let (work, target) =
+                    match Worker::check_queues(
+                        my_id, &pri_rx, &rx, &mut pri_work_count
+                    )
+                    {
+                        // if the channels are disconnected, return
+                        WorkStatus(-1, _, _) => return,
+                        WorkStatus(_, job, target) => {
+                            (job, target)
+                        },
+                    };
+
+                // if there's a job, get it done first, and calc the idle period since last actual job
+                done = work
+                    .and_then(|job| {
+                        // if we have work, do them now
+                        Worker::handle_work(job, &mut since)
+                    })
+                    .or_else(|| {
+                        // if we don't have the work, calculate the idle period
+                        Worker::calc_idle(&since)
+                    })
+                    .and_then(|idle| {
+                        // if idled longer than the expected worker life for unprivileged workers,
+                        // then we're done now -- self-purging.
+                        let max = max_idle.load(Ordering::Relaxed) as u128;
+                        if max.gt(&0) && max.le(&idle.as_millis()) {
+                            // mark self as a voluntary retiree
+                            graveyard.write().insert(my_id);
+                            return Some(());
+                        }
+
+                        None
+                    })
+                    .is_some();
+
+                // if it's a target kill, handle it now
+                done = done || target
+                    .and_then(|id_slice| {
+                        // update the graveyard
+                        let mut found = false;
+                        let forced = ThreadPool::is_forced_close();
+
+                        if !id_slice.is_empty() {
+                            // write and done, keep the write lock scoped
+                            let mut g = graveyard.write();
+                            for id in id_slice {
+                                g.insert(id);
+                                found = found || (id == 0 && forced) || id == my_id;
+                            }
+                        }
+
+                        // if my id or a forced kill, just quit
+                        if found {
+                            return Some(());
+                        }
+
+                        None
+                    })
+                    .is_some();
+
+                if done {
                     return;
                 }
 
-                // if there's a job, get it done first, and calc the idle period since last actual job
-                idle = if courier.work.is_some() {
-                    Worker::handle_work(courier.work.take(), &mut since)
-                } else if since.is_some() {
-                    Worker::calc_idle(&since)
-                } else {
-                    None
-                };
-
-                //===========================
-                //    after-work handling
-                //===========================
-
-                // if it's a target kill, handle it now
-                if let Some(id_slice) = courier.target.take() {
-                    // update the graveyard
-                    let mut found = false;
-                    let forced = ThreadPool::is_forced_close();
-
-                    if id_slice.len() == 1 {
-                        graveyard.write().insert(id_slice[0]);
-                        found = (id_slice[0] == 0 && forced) || id_slice[0] == my_id;
-                    } else if id_slice.len() > 1{
-                        let mut g = graveyard.write();
-                        for id in id_slice {
-                            g.insert(id);
-                            if !found {
-                                found = (id == 0 && forced) || id == my_id;
-                            }
-                        }
-                    }
-
-                    // if my id or a forced kill, just quit
-                    if found {
-                        return;
-                    }
-                }
-
-                // if idled longer than the expected worker life for unprivileged workers,
-                // then we're done now -- self-purging.
-                if let Some(idle) = idle.take() {
-                    let max = max_idle.load(Ordering::Relaxed) as u128;
-                    if max.gt(&0) && max.le(&idle.as_millis()) {
-                        // mark self as a voluntary retiree
-                        graveyard.write().insert(my_id);
-                        return;
-                    }
-                }
+                //TODO: check if shall hibernate ...
             }
         }).unwrap()
     }
@@ -247,8 +259,7 @@ impl Worker {
         pri_chan: &channel::Receiver<Message>,
         norm_chan: &channel::Receiver<Message>,
         pri_work_count: &mut u8,
-        courier: &mut WorkCourier,
-    ) -> Status
+    ) -> WorkStatus
     {
         // wait for work loop, 1/3 of workers will long-park for priority work, and 1/3 of workers
         // will long-park for normal work, the remainder 1/3 workers will be fluid and constantly
@@ -261,7 +272,7 @@ impl Worker {
             ) {
                 Ok(message) => {
                     // message is the only place that can update the "done" field
-                    Worker::unpack_message(message, courier);
+                    let (job, target) = Worker::unpack_message(message);
 
                     if *pri_work_count < 4 {
                         // only add if we're below the continuous pri-work cap
@@ -273,11 +284,11 @@ impl Worker {
                         *pri_work_count = 255;
                     }
 
-                    return Status(0);
+                    return WorkStatus(0, job, target);
                 },
                 Err(channel::RecvTimeoutError::Disconnected) => {
                     // sender has been dropped
-                    return Status(-1);
+                    return WorkStatus(-1, None, None);
                 },
                 Err(channel::RecvTimeoutError::Timeout) => {
                     // if chan empty, do nothing and fall through to the normal chan handle
@@ -297,21 +308,21 @@ impl Worker {
         ) {
             Ok(message) => {
                 // message is the only place that can update the "done" field
-                Worker::unpack_message(message, courier);
+                let (job, target) = Worker::unpack_message(message);
                 *pri_work_count = 0;
 
-                return Status(0);
+                return WorkStatus(0, job, target);
             },
             Err(channel::RecvTimeoutError::Disconnected) => {
                 // sender has been dropped
-                return Status(-1);
+                return WorkStatus(-1, None, None);
             },
             Err(channel::RecvTimeoutError::Timeout) => {
                 // nothing to receive yet
             }
         };
 
-        Status(0)
+        WorkStatus(0, None, None)
     }
 
     fn fetch_work(
@@ -347,30 +358,25 @@ impl Worker {
         }
     }
 
-    fn handle_work(work: Option<Job>, since: &mut Option<SystemTime>) -> Option<Duration> {
-        let mut idle = None;
-        if let Some(work) = work {
-            work.call_box();
+    fn handle_work(work: Job, since: &mut Option<SystemTime>) -> Option<Duration> {
+        work.call_box();
 
-            if since.is_some() {
-                idle = Worker::calc_idle(&since);
-                *since = Some(SystemTime::now());
-            }
+        let mut idle = None;
+        if since.is_some() {
+            idle = Worker::calc_idle(&since);
+            *since = Some(SystemTime::now());
         }
 
         idle
     }
 
-    fn unpack_message(
-        message: Message,
-        courier: &mut WorkCourier
-    ) {
+    fn unpack_message(message: Message) -> (Option<Job>, Option<Vec<usize>>) {
         match message {
             Message::NewJob(job) => {
-                courier.work = Some(job);
+                (Some(job), None)
             },
             Message::Terminate(target) => {
-                courier.target = Some(target);
+                (None, Some(target))
             }
         }
     }

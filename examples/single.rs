@@ -6,9 +6,10 @@ use threads_pool::shared_mode;
 
 fn main() {
     shared_mode::initialize(4);
-    let debug = true;
 
+    let debug = true;
     let now = Instant::now();
+
     for num in 0..=203 {
         println!("Sending job: {}...", num);
 

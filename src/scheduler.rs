@@ -1,10 +1,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::vec;
-
 use crossbeam_channel as channel;
 use crossbeam_channel::{Sender, SendTimeoutError, TrySendError, SendError};
-use crate::config::{Config, ConfigStatus};
+use crate::config::Config;
 use crate::debug::is_debug_mode;
 use crate::model::*;
 use crate::manager::*;
@@ -14,6 +13,11 @@ const CHAN_CAP: usize = 16;
 const THRESHOLD: usize = 1024;
 const AUTO_EXTEND_TRIGGER_SIZE: usize = 2;
 static FORCE_CLOSE: AtomicBool = AtomicBool::new(false);
+
+const FLAG_NORMAL: u8 = 0;
+const FLAG_CLOSING: u8 = 1;
+const FLAG_HIBERNATING: u8 = 2;
+const FLAG_LAZY_INIT: u8 = 4;
 
 /// Enumeration to indicate possible reasons a job execution request is rejected. User will need to
 /// resubmit the job again, since closure's state may have been stale at the execution error.
@@ -54,70 +58,55 @@ pub struct ThreadPool {
     /// default to 1024, but the threshold can be adjusted through the `set_queue_size_threshold` API.
     auto_extend_threshold: usize,
 
+    /// Determine the pool status: 1) Closing -- this will serve as the gate keeper for rejecting any
+    /// jobs _after_ a pool shutting down is scheduled; 2) Hibernating -- this will serve as a gate
+    /// keeper from accepting any new jobs if the pool is hibernating.
+    status: u8,
+
     /// If we allow the pool to scale itself without explicitly API calls. If this option is turned
     /// on, we will automatically add more workers to the reservoir when the pool is under pressure
     /// (i.e. more submitted jobs in queue than workers can handle), These temp workers will stick
     /// around for a while, and eventually retire after being idle for a period of time.
     auto_scale: bool,
-    blocking: bool,
-    closing: bool,
+
+    /// Determine if the job handover shall return immediately, i.e. in `non-blocking` mode.
+    non_blocking: bool,
+
+    /// Set the timeout period before we retry or give up executing the submitted job. If leaving this
+    /// field for `None`, the job submission will block the caller until a thread worker is freed up
+    /// in blocking mode, or return with error immediately if in the non-blocking mode (i.e.
+    /// `non_blocking` field set to `true`).
     queue_timeout: Option<Duration>,
 }
 
 impl ThreadPool {
     /// Create a `ThreadPool` with default configurations
     pub fn new(size: usize) -> ThreadPool {
-        Self::new_with_config(size, Config::default())
+        Self::create_pool(size, Config::default(), false)
     }
 
     /// Create a `ThreadPool` with supplied configurations
     pub fn new_with_config(size: usize, config: Config) -> ThreadPool {
-        let pool_size = match size {
-            _ if size < 1 => 1,
-            _ if size > THRESHOLD => THRESHOLD,
-            _ => size,
-        };
-
-        let (tx, rx) = channel::bounded(CHAN_CAP);
-        let (pri_tx, pri_rx) = channel::bounded(CHAN_CAP);
-
-        let manager = Manager::new(
-            config.pool_name(),
-            pool_size,
-            pri_rx,
-            rx,
-            config.worker_behavior()
-        );
-
-        ThreadPool {
-            manager,
-            chan: (pri_tx, tx),
-            init_size: pool_size,
-            upgrade_threshold: CHAN_CAP / 2,
-            auto_extend_threshold: THRESHOLD,
-            queue_timeout: None,
-            auto_scale: false,
-            blocking: config.blocking(),
-            closing: false,
-        }
+        Self::create_pool(size, config, false)
     }
 
     /// Create the `ThreadPool` with default pool configuration settings. When ready to activate the
     /// pool, invoke the `activate_pool` API before submitting jobs for execution. You can also
     /// call `exec` API to automatically activate the pool, however, calling the alternative immutable
     /// API `execute` will always lead to an error.
-    pub fn lazy_create(size: usize) -> ThreadPool {
-        Self::lazy_create_with_config(size, Config::default())
+    pub fn build(size: usize) -> ThreadPool {
+        Self::create_pool(size, Config::default(), true)
     }
 
     /// Create the `ThreadPool` with provided pool configuration settings. When ready to activate the
     /// pool, invoke the `activate_pool` API before submitting jobs for execution. You can also
     /// call `exec` API to automatically activate the pool, however, calling the alternative immutable
     /// API `execute` will always lead to an error.
-    pub fn lazy_create_with_config(size: usize, config: Config) -> ThreadPool {
-        //TODO: replace with real impl ...
-        Self::new_with_config(size, config)
+    pub fn build_with_config(size: usize, config: Config) -> ThreadPool {
+        Self::create_pool(size, config, true)
     }
+
+    //TODO: also impl hibernation of the pool?
 
     /// If the pool is lazy created, user is responsible for activating the pool before submitting jobs
     /// for execution. API `exec` will initialized the pool since it takes the mutable `self`, and hence
@@ -133,41 +122,71 @@ impl ThreadPool {
     /// use std::time::Duration;
     ///
     /// // lazy-create the pool
-    /// let mut pool = ThreadPool::lazy_create(4);
+    /// let mut pool = ThreadPool::build(4);
     ///
     /// // work on other stuff ...
     /// thread::sleep(Duration::from_secs(4));
     ///
     /// // get ready to submit parallel jobs, first of all, activate the pool. Not that this step is
     /// // optional if the caller will only use the `exec` API to submit jobs.
-    /// pool.activate_pool();
+    /// pool.activate()
+    ///     .execute(|| {
+    ///         // this closure could cause panic if the pool has not been activated yet.
+    ///         println!("Lazy created pool now accepting new jobs...");
+    ///     });
     ///
     /// // do parallel stuff.
     /// for id in 0..10 {
+    ///     // API `exec` can also activate the pool automatically if it's lazy-created.
     ///     pool.exec(|| {
     ///         thread::sleep(Duration::from_secs(1));
     ///         println!("thread {} has been waken after 1 seconds ... ", id);
     ///     }, true);
     /// }
     /// ```
-    pub fn activate_pool(&mut self) -> bool {
-        if self.closing || self.init_size == 0 {
-            return false;
+    pub fn activate(&mut self) -> &mut Self {
+        debug_assert!(self.init_size > 0, "The initial pool size must be equal or larger than 1 ...");
+
+        // No need or can't activate ...
+        if self.status == FLAG_NORMAL || self.status == FLAG_CLOSING {
+            return self;
         }
 
+        // Wake up everybody
+        if self.status == FLAG_HIBERNATING {
+            // call to unhibernate
+            self.unhibernate();
+            return self;
+        }
+
+        // Only case to handle: the pool is lazy created, than we need to add workers now.
         let workers_count = self.manager.workers_count();
         if workers_count < self.init_size {
             // lazy init the pool at the first job, or regenerate workers when all are purged
             self.manager.add_workers(self.init_size - workers_count);
         }
 
-        true
+        self.status = FLAG_NORMAL;
+        self
+    }
+
+    pub fn unhibernate(&mut self) {
+        if self.status != FLAG_HIBERNATING {
+            // unexpected status, just return
+            return;
+        }
+
+        // wake up everybody, the API will take the chance to clean up the graveyard
+        self.manager.wake_up();
+
+        //reset the flag
+        self.status = FLAG_NORMAL;
     }
 
     /// Set the time out period for a job to be queued. If `timeout` is defined as some duration,
     /// we will keep the new jobs in the queue for at least them amount of time when all workers of
     /// the pool are busy. If it's set to `None` and all workers are busy at the moment a job comes,
-    /// we will either block the caller when pool's blocking setting is turned on, or return timeout
+    /// we will either block the caller when pool's non_blocking setting is turned on, or return timeout
     /// error immediately when the setting is turned off.
     pub fn set_exec_timeout(&mut self, timeout: Option<Duration>) {
         self.queue_timeout = timeout;
@@ -175,8 +194,8 @@ impl ThreadPool {
 
     /// Toggle if we should block the execution APIs when all workers are busy and we can't expand
     /// the thread pool anymore for any reasons.
-    pub fn toggle_blocking(&mut self, blocking: bool) {
-        self.blocking = blocking;
+    pub fn toggle_blocking(&mut self, non_blocking: bool) {
+        self.non_blocking = non_blocking;
     }
 
     /// Toggle if we can add temporary workers when the `ThreadPool` is under pressure. The temporary
@@ -202,7 +221,7 @@ impl ThreadPool {
     /// to be taken by the workers sooner than jobs without a priority.
     ///
     /// Note that if the `ThreadPool` is created using delayed pool initialization, i.e. created using
-    /// either `lazy_create` or `lazy_create_with_config` APIs, then the pool will be initialized at
+    /// either `build` or `build_with_config` APIs, then the pool will be initialized at
     /// the first time a job is to be executed.
     ///
     /// # Examples
@@ -225,17 +244,16 @@ impl ThreadPool {
     pub fn exec<F: FnOnce() + Send + 'static>(&mut self, f: F, prioritized: bool)
         -> Result<(), ExecutionError>
     {
-        if self.closing {
+        if self.status == FLAG_CLOSING {
             return Err(ExecutionError::Disconnected);
         }
 
         if self.manager.workers_count() == 0 {
-            if self.init_size > 0 {
-                // lazy init the pool at the first job, or regenerate workers when all are purged
-                self.manager.add_workers(self.init_size);
-            } else {
+            if self.status == FLAG_NORMAL {
                 // no worker to take the job
                 return Err(ExecutionError::Uninitialized);
+            } else {
+                self.activate();
             }
         }
 
@@ -261,10 +279,36 @@ impl ThreadPool {
             })
     }
 
+    /// Similar to `exec`, yet this is the simplified version taking an immutable version of the pool.
+    /// The job priority will be automatically evaluated based on the queue length, and for pool
+    /// under pressure, we will try to balance the queue.
+    ///
+    /// This method will be no-op if the pool is lazy-created (i.e. created via the `build` functions)
+    /// and `activate` has not been called on it yet. If you are not sure if the pool has been
+    /// activated or not, alter to use `exec` instead, which will initiate the pool if that's not
+    /// done yet.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// extern crate threads_pool;
+    /// use threads_pool::ThreadPool;
+    /// use std::thread;
+    /// use std::time::Duration;
+    ///
+    /// let pool = ThreadPool::new(4);
+    ///
+    /// for id in 0..10 {
+    ///     pool.execute(|| {
+    ///         thread::sleep(Duration::from_secs(1));
+    ///         println!("thread {} has been waken after 1 seconds ... ", id);
+    ///     });
+    /// }
+    /// ```
     pub fn execute<F: FnOnce() + Send + 'static>(&self, f: F)
         -> Result<(), ExecutionError>
     {
-        if self.closing {
+        if self.status != FLAG_NORMAL {
             return Err(ExecutionError::Disconnected);
         }
 
@@ -273,7 +317,8 @@ impl ThreadPool {
             return Err(ExecutionError::Uninitialized);
         }
 
-        self.dispatch(Message::NewJob(Box::new(f)), -1, !self.chan.0.is_full())
+        let prioritized = self.chan.1.is_empty() && !self.chan.0.is_full();
+        self.dispatch(Message::NewJob(Box::new(f)), -1, prioritized)
             .map(|_| {})
             .map_err(|err| {
                 match err {
@@ -281,6 +326,10 @@ impl ThreadPool {
                     SendTimeoutError::Disconnected(_) => ExecutionError::Disconnected,
                 }
             })
+    }
+
+    pub(crate) fn is_forced_close() -> bool {
+        FORCE_CLOSE.load(Ordering::Acquire)
     }
 
     fn dispatch(&self, message: Message, retry: i8, with_priority: bool)
@@ -318,7 +367,7 @@ impl ThreadPool {
                 }
             },
             None => {
-                if self.blocking {
+                if !self.non_blocking {
                     // wait until a worker is ready to take new work
                     match chan.send(message) {
                         Ok(()) => Ok(was_busy),
@@ -357,8 +406,43 @@ impl ThreadPool {
         }
     }
 
-    pub(crate) fn is_forced_close() -> bool {
-        FORCE_CLOSE.load(Ordering::SeqCst)
+    fn create_pool(size: usize, config: Config, lazy_built: bool) -> ThreadPool {
+        let pool_size = match size {
+            _ if size < 1 => 1,
+            _ if size > THRESHOLD => THRESHOLD,
+            _ => size,
+        };
+
+        let (tx, rx) = channel::bounded(CHAN_CAP);
+        let (pri_tx, pri_rx) = channel::bounded(CHAN_CAP);
+        let non_blocking = config.non_blocking();
+
+        let flag = if !lazy_built {
+            FLAG_NORMAL
+        } else {
+            FLAG_LAZY_INIT
+        };
+
+        let manager =
+            Manager::build(
+                config,
+                pool_size,
+                pri_rx,
+                rx,
+                lazy_built,
+            );
+
+        ThreadPool {
+            manager,
+            chan: (pri_tx, tx),
+            init_size: pool_size,
+            upgrade_threshold: CHAN_CAP / 2,
+            auto_extend_threshold: THRESHOLD,
+            status: flag,
+            auto_scale: false,
+            non_blocking,
+            queue_timeout: None,
+        }
     }
 }
 
@@ -483,7 +567,7 @@ impl PoolManager for ThreadPool {
     }
 
     fn close(&mut self) {
-        self.closing = true;
+        self.status = FLAG_CLOSING;
         self.clear();
     }
 

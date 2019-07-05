@@ -7,56 +7,49 @@ use parking_lot::RwLock;
 use crate::debug::is_debug_mode;
 use crate::model::{Message, WorkerUpdate};
 use crate::worker::{Worker, WorkerConfig};
+use crate::Config;
+use crate::config::ConfigStatus;
 
 pub(crate) struct Manager {
-    name: Option<String>,
+    config: Config,
     workers: Vec<Worker>,
     last_worker_id: usize,
     graveyard: Arc<RwLock<HashSet<usize>>>,
     max_idle: Arc<AtomicUsize>,
-    status_behavior: StatusBehaviors,
     chan: (Receiver<Message>, Receiver<Message>),
 }
 
 impl Manager {
-    pub(crate) fn new(
-        name: Option<String>,
+    pub(crate) fn build(
+        config: Config,
         range: usize,
         pri_rx: Receiver<Message>,
         rx: Receiver<Message>,
-        behavior: StatusBehaviors,
+        lazy_built: bool,
     ) -> Manager
     {
-        let mut m = Self::lazy_create(name, pri_rx, rx, behavior);
-        m.add_workers(range);
-        m.graveyard.write().reserve(range);
+        let mut m = Manager {
+            config,
+            workers: Vec::new(),
+            last_worker_id: 0,
+            graveyard: Arc::new(RwLock::new(HashSet::new())),
+            max_idle: Arc::new(AtomicUsize::new(0)),
+            chan: (pri_rx, rx),
+        };
 
-        if is_debug_mode() {
-            println!("Pool has been initialized with {} pools", m.workers.len());
+        if !lazy_built {
+            m.add_workers(range);
+            m.graveyard.write().reserve(range);
+
+            if is_debug_mode() {
+                println!("Pool has been initialized with {} pools", m.workers.len());
+            }
         }
 
         m
     }
 
-    pub(crate) fn lazy_create(
-        name: Option<String>,
-        pri_rx: Receiver<Message>,
-        rx: Receiver<Message>,
-        behavior: StatusBehaviors,
-    ) -> Manager
-    {
-        Manager {
-            name,
-            workers: Vec::new(),
-            last_worker_id: 0,
-            graveyard: Arc::new(RwLock::new(HashSet::new())),
-            max_idle: Arc::new(AtomicUsize::new(0)),
-            status_behavior: behavior,
-            chan: (pri_rx, rx),
-        }
-    }
-
-    pub(crate) fn remove_all(&mut self, wait: bool) {
+    pub(crate) fn remove_all(&mut self, sync_remove: bool) {
         for mut worker in self.workers.drain(..) {
             let id = worker.get_id();
 
@@ -68,10 +61,12 @@ impl Manager {
             // all their work is now done and threads joined. Only do this if the shutdown message
             // is delivered such that workers may be able to quit the infinite-loop and join the
             // thread later.
-            if wait {
-                self.status_behavior.before_drop(id);
+            if sync_remove {
+                let behavior = self.config.worker_behavior();
+
+                behavior.before_drop(id);
                 worker.retire();
-                self.status_behavior.after_drop(id);
+                behavior.after_drop(id);
             }
         }
 
@@ -87,22 +82,26 @@ impl Manager {
 
         if self.last_worker_id > 0 {
             // before adding new workers, remove killed ones.
-            self.graveyard_trim();
+            self.graveyard_cleanup();
         }
 
         // reserve rooms for workers
         self.workers.reserve(count);
 
         // the start id is the next integer from the last worker's id
+        let base_name = self.config.pool_name().cloned();
+        let stack_size = self.config.thread_size();
+
         (1..=count).for_each(|offset| {
             // Worker is created to subscribe, but would register self later when pulled from the
             // workers queue
             let id = self.last_worker_id + offset;
-            let worker_name = self.name.as_ref().and_then(|name| {
-                Some(format!("{}-{}", name, id))
-            });
-
             let (rx, pri_rx) = (self.chan.0.clone(), self.chan.1.clone());
+
+            let worker_name = match base_name.as_ref() {
+                Some(name) => Some(format!("{}-{}", name, id)),
+                None => None,
+            };
 
             self.workers.push(
                 Worker::new(
@@ -112,11 +111,11 @@ impl Manager {
                     Arc::clone(&self.graveyard),
                     WorkerConfig::new(
                         worker_name,
-                        0,
+                        stack_size,
                         false,
                         Arc::clone(&self.max_idle),
                     ),
-                    &self.status_behavior
+                    self.config.worker_behavior()
                 )
             );
         });
@@ -124,7 +123,19 @@ impl Manager {
         self.last_worker_id += count;
     }
 
-    fn graveyard_trim(&mut self) {
+    pub(crate) fn wake_up(&mut self) {
+        // take the chance to clean up the graveyard
+        self.graveyard_cleanup();
+
+        // call everyone to wake up and work
+        self.workers
+            .iter()
+            .for_each(|worker| {
+                worker.wake_up();
+            });
+    }
+
+    fn graveyard_cleanup(&mut self) {
         let g = {
             let mut g = self.graveyard.write();
 

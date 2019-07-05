@@ -4,24 +4,30 @@ use crate::model::WorkerUpdate;
 
 #[derive(Clone)]
 pub struct Config {
-    blocking: bool,
+    non_blocking: bool,
     pool_name: Option<String>,
-    worker_behaviors: StatusBehaviors,
     refresh_period: Option<Duration>,
+    worker_behaviors: StatusBehaviors,
+    thread_size: usize,
 }
 
 impl Config {
     pub fn new() -> Self {
         Config {
-            blocking: false,
+            non_blocking: false,
             pool_name: None,
-            worker_behaviors: StatusBehaviors::default(),
             refresh_period: None,
+            worker_behaviors: StatusBehaviors::default(),
+            thread_size: 0,
         }
     }
 
-    pub(crate) fn blocking(&self) -> bool {
-        self.blocking
+    pub(crate) fn non_blocking(&self) -> bool {
+        self.non_blocking
+    }
+
+    pub(crate) fn thread_size(&self) -> usize {
+        self.thread_size
     }
 }
 
@@ -32,46 +38,64 @@ impl Default for Config {
 }
 
 pub trait ConfigStatus {
-    fn pool_name(&self) -> Option<String>;
+    fn pool_name(&self) -> Option<&String>;
     fn refresh_period(&self) -> Option<Duration>;
-    fn worker_behavior(&self) -> StatusBehaviors;
-    fn set_pool_name(&mut self, name: String);
-    fn set_refresh_period(&mut self, period: Option<Duration>);
-    fn set_worker_behavior(&mut self, behavior: StatusBehaviors);
-    fn set_blocking(&mut self, blocking: bool);
+    fn worker_behavior(&self) -> &StatusBehaviors;
+    fn set_pool_name(&mut self, name: String) -> &mut Self;
+    fn set_refresh_period(&mut self, period: Option<Duration>) -> &mut Self;
+    fn set_worker_behavior(&mut self, behavior: StatusBehaviors) -> &mut Self;
+    fn set_none_blocking(&mut self, non_blocking: bool) -> &mut Self;
+    fn set_thread_size(&mut self, size: usize) -> &mut Self;
 }
 
 impl ConfigStatus for Config {
-    fn pool_name(&self) -> Option<String> {
-        self.pool_name.clone()
+    fn pool_name(&self) -> Option<&String> {
+        self.pool_name.as_ref()
     }
 
     fn refresh_period(&self) -> Option<Duration> {
         self.refresh_period
     }
 
-    fn worker_behavior(&self) -> StatusBehaviors {
-        self.worker_behaviors.clone()
+    fn worker_behavior(&self) -> &StatusBehaviors {
+        &self.worker_behaviors
     }
 
-    fn set_pool_name(&mut self, name: String) {
+    fn set_pool_name(&mut self, name: String) -> &mut Self {
         if name.is_empty() {
             self.pool_name = None;
         } else {
             self.pool_name.replace(name);
         }
+
+        self
     }
 
-    fn set_refresh_period(&mut self, period: Option<Duration>) {
+    fn set_refresh_period(&mut self, period: Option<Duration>) -> &mut Self {
         self.refresh_period = period;
+        self
     }
 
-    fn set_worker_behavior(&mut self, behavior: StatusBehaviors) {
-        self.worker_behaviors = behavior
+    fn set_worker_behavior(&mut self, behavior: StatusBehaviors) -> &mut Self {
+        self.worker_behaviors = behavior;
+        self
     }
 
-    fn set_blocking(&mut self, blocking: bool) {
-        self.blocking = blocking;
+    /// Toggle on/off of the pool's non-blocking mode. If the pool is in the non-blocking mode, the
+    /// `ThreadPool` will take the job submission and move on immediately, regardless of if the job
+    /// submission is successful or not.
+    ///
+    /// Please use cautious when toggling the pool to the non-blocking more: if the pool is busy
+    /// (i.e. all thread workers are busy) and the job queue is full, a new non-blocking job submission
+    /// will cause the job to be dropped and lost forever.
+    fn set_none_blocking(&mut self, non_blocking: bool) -> &mut Self {
+        self.non_blocking = non_blocking;
+        self
+    }
+
+    fn set_thread_size(&mut self, size: usize) -> &mut Self {
+        self.thread_size = size;
+        self
     }
 }
 

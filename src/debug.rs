@@ -4,6 +4,7 @@ use std::sync::{Once, ONCE_INIT};
 static ONCE: Once = ONCE_INIT;
 static mut DEBUG: bool = false;
 
+#[inline(always)]
 pub(crate) fn is_debug_mode() -> bool {
     unsafe {
         ONCE.call_once(|| {
