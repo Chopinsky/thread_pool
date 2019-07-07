@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::vec;
 use crossbeam_channel as channel;
@@ -12,12 +11,6 @@ const RETRY_LIMIT: i8 = 4;
 const CHAN_CAP: usize = 16;
 const THRESHOLD: usize = 1024;
 const AUTO_EXTEND_TRIGGER_SIZE: usize = 2;
-static FORCE_CLOSE: AtomicBool = AtomicBool::new(false);
-
-const FLAG_NORMAL: u8 = 0;
-const FLAG_CLOSING: u8 = 1;
-const FLAG_HIBERNATING: u8 = 2;
-const FLAG_LAZY_INIT: u8 = 4;
 
 /// Enumeration to indicate possible reasons a job execution request is rejected. User will need to
 /// resubmit the job again, since closure's state may have been stale at the execution error.
@@ -106,8 +99,6 @@ impl ThreadPool {
         Self::create_pool(size, config, true)
     }
 
-    //TODO: also impl hibernation of the pool?
-
     /// If the pool is lazy created, user is responsible for activating the pool before submitting jobs
     /// for execution. API `exec` will initialized the pool since it takes the mutable `self`, and hence
     /// is able to initialize the pool. However, fail to explicitly initialize the pool could cause
@@ -148,13 +139,13 @@ impl ThreadPool {
         debug_assert!(self.init_size > 0, "The initial pool size must be equal or larger than 1 ...");
 
         // No need or can't activate ...
-        if self.status == FLAG_NORMAL || self.status == FLAG_CLOSING {
+        if self.status != FLAG_HIBERNATING || self.status != FLAG_LAZY_INIT {
             return self;
         }
 
         // Wake up everybody
         if self.status == FLAG_HIBERNATING {
-            // call to unhibernate
+            // call to unhibernate, the `unhibernate` API will handle the status updates
             self.unhibernate();
             return self;
         }
@@ -163,24 +154,12 @@ impl ThreadPool {
         let workers_count = self.manager.workers_count();
         if workers_count < self.init_size {
             // lazy init the pool at the first job, or regenerate workers when all are purged
-            self.manager.add_workers(self.init_size - workers_count);
+            self.manager.add_workers(self.init_size - workers_count, true);
         }
 
-        self.status = FLAG_NORMAL;
+        // update the status after activation.
+        self.set_status(FLAG_NORMAL);
         self
-    }
-
-    pub fn unhibernate(&mut self) {
-        if self.status != FLAG_HIBERNATING {
-            // unexpected status, just return
-            return;
-        }
-
-        // wake up everybody, the API will take the chance to clean up the graveyard
-        self.manager.wake_up();
-
-        //reset the flag
-        self.status = FLAG_NORMAL;
     }
 
     /// Set the time out period for a job to be queued. If `timeout` is defined as some duration,
@@ -244,30 +223,36 @@ impl ThreadPool {
     pub fn exec<F: FnOnce() + Send + 'static>(&mut self, f: F, prioritized: bool)
         -> Result<(), ExecutionError>
     {
-        if self.status == FLAG_CLOSING {
+        // we're closing the pool, take no more new jobs
+        if self.status == FLAG_CLOSING || self.status == FLAG_FORCE_CLOSE {
             return Err(ExecutionError::Disconnected);
         }
 
-        if self.manager.workers_count() == 0 {
-            if self.status == FLAG_NORMAL {
-                // no worker to take the job
-                return Err(ExecutionError::Uninitialized);
-            } else {
-                self.activate();
-            }
+        // if at the hibernation or lazy init mode
+        if self.status != FLAG_NORMAL {
+            self.activate();
         }
 
+        // still no worker to take the job? unexpected and should return error
+        let worker_count = self.manager.workers_count();
+        if worker_count == 0 {
+            return Err(ExecutionError::Uninitialized);
+        }
+
+        // if we can auto scale the pool, set the retry stack limit
         let retry = if self.auto_scale {
             0
         } else {
             -1
         };
-        
+
+        // send the job for execution
         self.dispatch(Message::NewJob(Box::new(f)), retry, prioritized)
             .map(|busy| {
                 if busy && self.auto_scale {
+                    // auto scale by adding more workers to take the job
                     if let Some(target) = self.resize_target(self.init_size) {
-                        self.resize(target);
+                        self.manager.add_workers(target - worker_count, false);
                     }
                 }
             })
@@ -308,7 +293,8 @@ impl ThreadPool {
     pub fn execute<F: FnOnce() + Send + 'static>(&self, f: F)
         -> Result<(), ExecutionError>
     {
-        if self.status != FLAG_NORMAL {
+        // we're closing, taking no more jobs.
+        if self.status == FLAG_CLOSING || self.status == FLAG_FORCE_CLOSE {
             return Err(ExecutionError::Disconnected);
         }
 
@@ -317,6 +303,8 @@ impl ThreadPool {
             return Err(ExecutionError::Uninitialized);
         }
 
+        // send the job to the queue for execution. note that if we're in hibernation, the queue
+        // will still take the new job, though no worker will be awaken to take the job.
         let prioritized = self.chan.1.is_empty() && !self.chan.0.is_full();
         self.dispatch(Message::NewJob(Box::new(f)), -1, prioritized)
             .map(|_| {})
@@ -326,10 +314,6 @@ impl ThreadPool {
                     SendTimeoutError::Disconnected(_) => ExecutionError::Disconnected,
                 }
             })
-    }
-
-    pub(crate) fn is_forced_close() -> bool {
-        FORCE_CLOSE.load(Ordering::Acquire)
     }
 
     fn dispatch(&self, message: Message, retry: i8, with_priority: bool)
@@ -406,6 +390,21 @@ impl ThreadPool {
         }
     }
 
+    fn set_status(&mut self, status: u8) {
+        self.manager.propagate_status(status);
+        self.status = status;
+    }
+
+    fn shut_down(&mut self, forced: bool) {
+        if !forced {
+            self.set_status(FLAG_CLOSING);
+        } else {
+            self.set_status(FLAG_FORCE_CLOSE);
+        }
+
+        self.clear();
+    }
+
     fn create_pool(size: usize, config: Config, lazy_built: bool) -> ThreadPool {
         let pool_size = match size {
             _ if size < 1 => 1,
@@ -443,6 +442,53 @@ impl ThreadPool {
             non_blocking,
             queue_timeout: None,
         }
+    }
+}
+
+pub trait Hibernation {
+    fn hibernate(&mut self);
+    fn unhibernate(&mut self);
+    fn is_hibernating(&self) -> bool;
+}
+
+impl Hibernation for ThreadPool {
+    /// Put the pool into hibernation mode. In this mode, all workers will park itself after finishing
+    /// the current job to reduce CPU usage.
+    ///
+    /// The pool will be prompted back to normal mode on 2 occasions:
+    /// 1) calling the `unhibernate` API to wake up the pool, or 2) sending a new job through the
+    /// `exec` API, which will automatically assume an unhibernation desire, wake self up, take and
+    /// execute the incoming job. Though if you call the immutable API `execute`, the job will be
+    /// queued yet not executed. Be aware that if the queue is full, the new job will be dropped and
+    /// an execution error will be returned in this case.
+    ///
+    /// It is recommended to explicitly call `unhibernate` when the caller want to wake up the pool,
+    /// to avoid side effect or undefined behaviors.
+    fn hibernate(&mut self) {
+        self.set_status(FLAG_HIBERNATING);
+    }
+
+    /// This will unhibernate the pool if it's currently in the hibernation mode. It will do nothing
+    /// if the pool is in any other operating mode, e.g. the working mode or shutting down mode.
+    ///
+    /// Cautious: calling this API will set the status flag to normal, which may conflict with actions
+    /// that would set status flag otherwise.
+    fn unhibernate(&mut self) {
+        // unexpected status, just return
+        if self.status != FLAG_HIBERNATING {
+            return;
+        }
+
+        // wake up everybody, the API will take the chance to clean up the graveyard
+        self.manager.wake_up(false);
+
+        //reset the flag only
+        self.set_status(FLAG_NORMAL);
+    }
+
+    /// Check if the pool is in hibernation mode.
+    fn is_hibernating(&self) -> bool {
+        self.status == FLAG_HIBERNATING
     }
 }
 
@@ -526,7 +572,7 @@ impl PoolManager for ThreadPool {
         }
     }
 
-    // Let extended workers to expire when idling for too long.
+    /// Let extended workers to expire when idling for too long.
     fn auto_expire(&mut self, life: Option<Duration>) {
         let actual_life = if let Some(l) = life {
             l.as_millis() as usize
@@ -553,27 +599,15 @@ impl PoolManager for ThreadPool {
     }
 
     fn clear(&mut self) {
-        let mut sent = false;
-        if let Ok(()) = self.chan.0.send(Message::Terminate(vec::from_elem(0, 1))) {
-            sent = true;
-        }
-
-        if !sent && is_debug_mode(){
-            // abort the clear process if we can't send the terminate message
-            eprintln!("Failed to send the terminate message, please try again...");
-        }
-
-        self.manager.remove_all(sent);
+        self.manager.remove_all(true);
     }
 
     fn close(&mut self) {
-        self.status = FLAG_CLOSING;
-        self.clear();
+        self.shut_down(false);
     }
 
     fn force_close(&mut self) {
-        FORCE_CLOSE.store(true, Ordering::SeqCst);
-        self.close();
+        self.shut_down(true);
     }
 }
 
@@ -651,6 +685,6 @@ impl Drop for ThreadPool {
             println!("Shutting down this individual pool, sending terminate message to all workers.");
         }
 
-        self.clear();
+        self.close();
     }
 }

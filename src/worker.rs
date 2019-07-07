@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
+use std::sync::{atomic::{AtomicUsize, AtomicU8, Ordering}, Arc};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
@@ -9,7 +9,6 @@ use parking_lot::RwLock;
 use crate::debug::is_debug_mode;
 use crate::manager::{StatusBehaviors, StatusBehaviorDefinitions};
 use crate::model::*;
-use crate::scheduler::ThreadPool;
 use hashbrown::HashSet;
 
 const TIMEOUT: Duration = Duration::from_micros(16);
@@ -17,61 +16,6 @@ const LONG_TIMEOUT: Duration = Duration::from_micros(96);
 const LOT_COUNTS: usize = 3;
 const LONG_PARKING_ROUNDS: u8 = 16;
 const SHORT_PARKING_ROUNDS: u8 = 4;
-
-pub(crate) struct WorkerConfig {
-    name: Option<String>,
-    stack_size: usize,
-    privileged: bool,
-    max_idle: Arc<AtomicUsize>,
-}
-
-impl WorkerConfig {
-    pub(crate) fn new(
-        name: Option<String>,
-        stack_size: usize,
-        privileged: bool,
-        max_idle: Arc<AtomicUsize>
-    ) -> Self
-    {
-        WorkerConfig {
-            name,
-            stack_size,
-            privileged,
-            max_idle,
-        }
-    }
-
-    pub(crate) fn set_stack_size(&mut self, size: usize) {
-        self.stack_size = size;
-    }
-
-    pub(crate) fn set_privilege(&mut self, privileged: bool) {
-        self.privileged = privileged;
-    }
-
-    pub(crate) fn name(&mut self, name: String) {
-        if name.is_empty() {
-            self.name = None;
-        } else {
-            self.name.replace(name);
-        }
-    }
-
-    pub(crate) fn max_idle(&mut self, idle: Arc<AtomicUsize>) {
-        self.max_idle = idle;
-    }
-}
-
-impl Default for WorkerConfig {
-    fn default() -> Self {
-        Self::new(
-            None,
-            0,
-            false,
-            Arc::new(AtomicUsize::new(0))
-        )
-    }
-}
 
 pub(crate) struct Worker {
     id: usize,
@@ -85,18 +29,23 @@ struct WorkStatus(i8, Option<Job>, Option<Vec<usize>>);
 impl Worker {
     /// Create and spawn the worker, this will dispatch the worker to listen to work queue immediately
     pub(crate) fn new(
+        name: Option<String>,
         my_id: usize,
+        stack_size: usize,
+        privileged: bool,
         pri_rx: channel::Receiver<Message>,
         rx: channel::Receiver<Message>,
         graveyard: Arc<RwLock<HashSet<usize>>>,
-        config: WorkerConfig,
+        max_idle: Arc<AtomicUsize>,
+        pool_status: Arc<AtomicU8>,
         behavior_definition: &StatusBehaviors,
     ) -> Worker
     {
         behavior_definition.before_start(my_id);
 
-        let worker: thread::JoinHandle<()> =
-            Self::spawn_worker(my_id, pri_rx, rx, graveyard, config);
+        let worker: thread::JoinHandle<()> = Self::spawn_worker(
+            name, my_id, stack_size, privileged, pri_rx, rx, graveyard, max_idle, pool_status
+        );
 
         behavior_definition.after_start(my_id);
 
@@ -116,9 +65,12 @@ impl Worker {
     /// Calling `retire` on a worker will block the thread until the worker has done its work, or wake
     /// up from hibernation. This could block the caller for an undetermined amount of time.
     pub(crate) fn retire(&mut self) {
-        if let Some(thread) = self.thread.take() {
+        if let Some(handle) = self.thread.take() {
+            // make sure we can wake up and quit
+            handle.thread().unpark();
+
             // make sure the work is done
-            thread.join().unwrap_or_else(|err| {
+            handle.join().unwrap_or_else(|err| {
                 eprintln!("Unable to drop worker: {}, error: {:?}", self.id, err);
             });
         }
@@ -127,37 +79,40 @@ impl Worker {
     /// If the worker has been put to sleep (i.e. in `park` mode), wake it up. This API will not check
     /// if the worker is actually hibernating or not.
     pub(crate) fn wake_up(&self) {
-        if let Some(t) = self.thread.as_ref() {
-            t.thread().unpark();
+        if let Some(handle) = self.thread.as_ref() {
+            handle.thread().unpark();
         }
     }
 
     fn spawn_worker(
+        name: Option<String>,
         my_id: usize,
+        stack_size: usize,
+        privileged: bool,
         pri_rx: channel::Receiver<Message>,
         rx: channel::Receiver<Message>,
         graveyard: Arc<RwLock<HashSet<usize>>>,
-        config: WorkerConfig,
+        max_idle: Arc<AtomicUsize>,
+        pool_status: Arc<AtomicU8>,
     ) -> thread::JoinHandle<()>
     {
         let mut builder = thread::Builder::new();
 
-        if config.name.is_some() {
+        if name.is_some() {
             builder = builder.name(
-                config.name.unwrap_or_else(|| format!("worker-{}", my_id))
+                name.unwrap_or_else(|| format!("worker-{}", my_id))
             );
         }
 
-        if config.stack_size > 0 {
-            builder = builder.stack_size(config.stack_size);
+        if stack_size > 0 {
+            builder = builder.stack_size(stack_size);
         }
-
-        let privileged = config.privileged;
-        let max_idle: Arc<AtomicUsize> = config.max_idle;
 
         builder.spawn(move || {
             let mut done: bool;
+            let mut status: u8;
             let mut pri_work_count: u8 = 0;
+
             let mut since = if privileged {
                 None
             } else {
@@ -168,19 +123,19 @@ impl Worker {
             loop {
                 // get ready to take new work from the channel
                 {
-                    let g = graveyard.read();
-
-                    if g.contains(&my_id) {
+                    if graveyard.read().contains(&my_id) {
                         return;
                     }
+                }
 
-                    if g.contains(&0)
-                        && (ThreadPool::is_forced_close() || pri_rx.is_empty() && rx.is_empty())
-                    {
-                        // if shutting down, check if we can abandon all work by checking forced
-                        // close flag, or when all work have been processed.
-                        return;
-                    }
+                // get the pool status code
+                status = pool_status.load(Ordering::Acquire);
+                if status == FLAG_FORCE_CLOSE
+                    || (status == FLAG_CLOSING && pri_rx.is_empty() && rx.is_empty())
+                {
+                    // if shutting down, check if we can abandon all work by checking forced
+                    // close flag, or when all work have been processed.
+                    return;
                 }
 
                 // wait for work loop
@@ -225,14 +180,13 @@ impl Worker {
                     .and_then(|id_slice| {
                         // update the graveyard
                         let mut found = false;
-                        let forced = ThreadPool::is_forced_close();
 
                         if !id_slice.is_empty() {
                             // write and done, keep the write lock scoped
                             let mut g = graveyard.write();
                             for id in id_slice {
                                 g.insert(id);
-                                found = found || (id == 0 && forced) || id == my_id;
+                                found = found || (id == 0 && status == FLAG_FORCE_CLOSE) || id == my_id;
                             }
                         }
 
@@ -249,7 +203,9 @@ impl Worker {
                     return;
                 }
 
-                //TODO: check if shall hibernate ...
+                if status == FLAG_HIBERNATING {
+                    thread::park();
+                }
             }
         }).unwrap()
     }

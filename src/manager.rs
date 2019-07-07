@@ -1,14 +1,19 @@
 #![allow(dead_code)]
 
-use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
+use std::sync::{atomic::{AtomicUsize, AtomicU8, Ordering}, Arc};
 use crossbeam_channel::Receiver;
 use hashbrown::HashSet;
 use parking_lot::RwLock;
 use crate::debug::is_debug_mode;
-use crate::model::{Message, WorkerUpdate};
-use crate::worker::{Worker, WorkerConfig};
+use crate::model::{Message, WorkerUpdate, FLAG_NORMAL, FLAG_HIBERNATING, FLAG_CLOSING, FLAG_FORCE_CLOSE};
+use crate::worker::Worker;
 use crate::Config;
 use crate::config::ConfigStatus;
+
+/// The first id that can be taken by workers. All previous ones are reserved for future use in the
+/// graveyard. Note that the `INIT_ID` is still the one reserved, and manager's first valid
+/// `last_worker_id` shall be greater than this id number.
+const INIT_ID: usize = 15;
 
 pub(crate) struct Manager {
     config: Config,
@@ -16,6 +21,7 @@ pub(crate) struct Manager {
     last_worker_id: usize,
     graveyard: Arc<RwLock<HashSet<usize>>>,
     max_idle: Arc<AtomicUsize>,
+    inner_status: Arc<AtomicU8>,
     chan: (Receiver<Message>, Receiver<Message>),
 }
 
@@ -31,14 +37,15 @@ impl Manager {
         let mut m = Manager {
             config,
             workers: Vec::new(),
-            last_worker_id: 0,
+            last_worker_id: INIT_ID,
             graveyard: Arc::new(RwLock::new(HashSet::new())),
             max_idle: Arc::new(AtomicUsize::new(0)),
+            inner_status: Arc::new(AtomicU8::new(FLAG_NORMAL)),
             chan: (pri_rx, rx),
         };
 
         if !lazy_built {
-            m.add_workers(range);
+            m.add_workers(range, true);
             m.graveyard.write().reserve(range);
 
             if is_debug_mode() {
@@ -49,7 +56,25 @@ impl Manager {
         m
     }
 
+    pub(crate) fn propagate_status(&mut self, new_status: u8) {
+        if new_status == FLAG_NORMAL
+            || new_status == FLAG_HIBERNATING
+            || new_status == FLAG_CLOSING
+            || new_status == FLAG_FORCE_CLOSE
+        {
+            self.inner_status.store(new_status, Ordering::Release);
+        }
+    }
+
     pub(crate) fn remove_all(&mut self, sync_remove: bool) {
+        // nothing to remove now
+        if self.workers.len() == 0 {
+            return;
+        }
+
+        // the behaviors
+        let behavior = self.config.worker_behavior();
+
         for mut worker in self.workers.drain(..) {
             let id = worker.get_id();
 
@@ -62,8 +87,6 @@ impl Manager {
             // is delivered such that workers may be able to quit the infinite-loop and join the
             // thread later.
             if sync_remove {
-                let behavior = self.config.worker_behavior();
-
                 behavior.before_drop(id);
                 worker.retire();
                 behavior.after_drop(id);
@@ -72,15 +95,15 @@ impl Manager {
 
         // also clear the graveyard
         self.graveyard.write().clear();
-        self.last_worker_id = 0;
+        self.last_worker_id = INIT_ID;
     }
 
-    pub(crate) fn add_workers(&mut self, count: usize) {
+    pub(crate) fn add_workers(&mut self, count: usize, privileged: bool) {
         if count == 0 {
             return;
         }
 
-        if self.last_worker_id > 0 {
+        if self.last_worker_id > INIT_ID {
             // before adding new workers, remove killed ones.
             self.graveyard_cleanup();
         }
@@ -105,16 +128,15 @@ impl Manager {
 
             self.workers.push(
                 Worker::new(
+                    worker_name,
                     id,
+                    stack_size,
+                    privileged,
                     pri_rx,
                     rx,
                     Arc::clone(&self.graveyard),
-                    WorkerConfig::new(
-                        worker_name,
-                        stack_size,
-                        false,
-                        Arc::clone(&self.max_idle),
-                    ),
+                    Arc::clone(&self.max_idle),
+                    Arc::clone(&self.inner_status),
                     self.config.worker_behavior()
                 )
             );
@@ -123,9 +145,11 @@ impl Manager {
         self.last_worker_id += count;
     }
 
-    pub(crate) fn wake_up(&mut self) {
-        // take the chance to clean up the graveyard
-        self.graveyard_cleanup();
+    pub(crate) fn wake_up(&mut self, closing: bool) {
+        if !closing {
+            // take the chance to clean up the graveyard
+            self.graveyard_cleanup();
+        }
 
         // call everyone to wake up and work
         self.workers
@@ -184,7 +208,7 @@ impl WorkerManagement for Manager {
     }
 
     fn extend_by(&mut self, more: usize) {
-        self.add_workers(more);
+        self.add_workers(more, true);
     }
 
     fn shrink_by(&mut self, less: usize) -> Vec<usize> {
@@ -192,22 +216,40 @@ impl WorkerManagement for Manager {
             return Vec::new();
         }
 
+        let mut g = self.graveyard.write();
         let start = self.workers.len() - less;
+
         self.workers
             .drain(start..)
-            .map(|w| w.get_id())
+            .map(|w| {
+                w.wake_up();
+                let id = w.get_id();
+                g.insert(id);
+                id
+            })
             .collect()
     }
 
     fn dismiss_worker(&mut self, id: usize) -> Option<usize> {
+        let mut res: Option<usize> = None;
+
         for idx in 0..self.workers.len() {
-            if self.workers[idx].get_id() == id {
+            let worker = &self.workers[idx];
+            if worker.get_id() == id {
+                // make sure the worker is awaken and hence can go away
+                worker.wake_up();
+
                 // swap out the worker, use swap_remove for better performance.
-                return Some(self.workers.swap_remove(idx).get_id());
+                res.replace(self.workers.swap_remove(idx).get_id());
+                break;
             }
         }
 
-        None
+        if res.is_some() {
+            self.graveyard.write().insert(id);
+        }
+
+        res
     }
 
     fn first_worker_id(&self) -> usize {
@@ -225,20 +267,19 @@ impl WorkerManagement for Manager {
     }
 
     fn next_worker_id(&self, curr_id: usize) -> usize {
+        let mut found = false;
         for worker in self.workers.iter() {
             let id = worker.get_id();
-            if id == curr_id {
+            if found {
                 return id;
+            }
+
+            if id == curr_id {
+                found = true;
             }
         }
 
         0
-    }
-}
-
-impl Drop for Manager {
-    fn drop(&mut self) {
-        self.remove_all(true);
     }
 }
 
