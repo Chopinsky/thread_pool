@@ -1,5 +1,7 @@
+use std::sync::{Arc, atomic::{AtomicU8, Ordering}};
 use std::time::Duration;
 use std::vec;
+
 use crossbeam_channel as channel;
 use crossbeam_channel::{Sender, SendTimeoutError, TrySendError, SendError};
 use crate::config::Config;
@@ -54,7 +56,7 @@ pub struct ThreadPool {
     /// Determine the pool status: 1) Closing -- this will serve as the gate keeper for rejecting any
     /// jobs _after_ a pool shutting down is scheduled; 2) Hibernating -- this will serve as a gate
     /// keeper from accepting any new jobs if the pool is hibernating.
-    status: u8,
+    status: Arc<AtomicU8>,
 
     /// If we allow the pool to scale itself without explicitly API calls. If this option is turned
     /// on, we will automatically add more workers to the reservoir when the pool is under pressure
@@ -138,13 +140,15 @@ impl ThreadPool {
     pub fn activate(&mut self) -> &mut Self {
         debug_assert!(self.init_size > 0, "The initial pool size must be equal or larger than 1 ...");
 
+        let status = self.status.load(Ordering::Acquire);
+
         // No need or can't activate ...
-        if self.status != FLAG_HIBERNATING || self.status != FLAG_LAZY_INIT {
+        if status != FLAG_HIBERNATING || status != FLAG_LAZY_INIT {
             return self;
         }
 
         // Wake up everybody
-        if self.status == FLAG_HIBERNATING {
+        if status == FLAG_HIBERNATING {
             // call to unhibernate, the `unhibernate` API will handle the status updates
             self.unhibernate();
             return self;
@@ -154,7 +158,7 @@ impl ThreadPool {
         let workers_count = self.manager.workers_count();
         if workers_count < self.init_size {
             // lazy init the pool at the first job, or regenerate workers when all are purged
-            self.manager.add_workers(self.init_size - workers_count, true);
+            self.manager.add_workers(self.init_size - workers_count, true, Arc::clone(&self.status));
         }
 
         // update the status after activation.
@@ -223,13 +227,15 @@ impl ThreadPool {
     pub fn exec<F: FnOnce() + Send + 'static>(&mut self, f: F, prioritized: bool)
         -> Result<(), ExecutionError>
     {
+        let status = self.status.load(Ordering::Acquire);
+
         // we're closing the pool, take no more new jobs
-        if self.status == FLAG_CLOSING || self.status == FLAG_FORCE_CLOSE {
+        if status == FLAG_CLOSING || status == FLAG_FORCE_CLOSE {
             return Err(ExecutionError::Disconnected);
         }
 
         // if at the hibernation or lazy init mode
-        if self.status != FLAG_NORMAL {
+        if status != FLAG_NORMAL {
             self.activate();
         }
 
@@ -252,7 +258,9 @@ impl ThreadPool {
                 if busy && self.auto_scale {
                     // auto scale by adding more workers to take the job
                     if let Some(target) = self.resize_target(self.init_size) {
-                        self.manager.add_workers(target - worker_count, false);
+                        self.manager.add_workers(
+                            target - worker_count, false, Arc::clone(&self.status)
+                        );
                     }
                 }
             })
@@ -293,8 +301,10 @@ impl ThreadPool {
     pub fn execute<F: FnOnce() + Send + 'static>(&self, f: F)
         -> Result<(), ExecutionError>
     {
+        let status = self.status.load(Ordering::Acquire);
+
         // we're closing, taking no more jobs.
-        if self.status == FLAG_CLOSING || self.status == FLAG_FORCE_CLOSE {
+        if status == FLAG_CLOSING || status == FLAG_FORCE_CLOSE {
             return Err(ExecutionError::Disconnected);
         }
 
@@ -391,8 +401,15 @@ impl ThreadPool {
     }
 
     fn set_status(&mut self, status: u8) {
-        self.manager.propagate_status(status);
-        self.status = status;
+        self.status.store(status, Ordering::SeqCst);
+    }
+
+    fn update_status(&mut self, old: u8, new: u8) -> bool {
+        if old == new {
+            return true;
+        }
+
+        self.status.compare_exchange_weak(old, new, Ordering::SeqCst, Ordering::Relaxed).is_ok()
     }
 
     fn shut_down(&mut self, forced: bool) {
@@ -416,16 +433,16 @@ impl ThreadPool {
         let (pri_tx, pri_rx) = channel::bounded(CHAN_CAP);
         let non_blocking = config.non_blocking();
 
-        let flag = if !lazy_built {
-            FLAG_NORMAL
-        } else {
-            FLAG_LAZY_INIT
-        };
+        let flag =
+            Arc::new(AtomicU8::new(
+                if !lazy_built { FLAG_NORMAL } else {FLAG_LAZY_INIT }
+            ));
 
         let manager =
             Manager::build(
                 config,
                 pool_size,
+                Arc::clone(&flag),
                 pri_rx,
                 rx,
                 lazy_built,
@@ -474,21 +491,16 @@ impl Hibernation for ThreadPool {
     /// Cautious: calling this API will set the status flag to normal, which may conflict with actions
     /// that would set status flag otherwise.
     fn unhibernate(&mut self) {
-        // unexpected status, just return
-        if self.status != FLAG_HIBERNATING {
-            return;
+        // only wake everyone up if we're in the right status
+        if self.update_status(FLAG_HIBERNATING, FLAG_NORMAL) {
+            // wake up everybody, the API will take the chance to clean up the graveyard
+            self.manager.wake_up(false);
         }
-
-        // wake up everybody, the API will take the chance to clean up the graveyard
-        self.manager.wake_up(false);
-
-        //reset the flag only
-        self.set_status(FLAG_NORMAL);
     }
 
     /// Check if the pool is in hibernation mode.
     fn is_hibernating(&self) -> bool {
-        self.status == FLAG_HIBERNATING
+        self.status.load(Ordering::Acquire) == FLAG_HIBERNATING
     }
 }
 
@@ -536,7 +548,7 @@ impl PoolManager for ThreadPool {
         }
 
         // manager will update the graveyard
-        self.manager.extend_by(more);
+        self.manager.extend_by(more, Arc::clone(&self.status));
     }
 
     fn shrink(&mut self, less: usize) {

@@ -33,18 +33,15 @@ impl Worker {
         my_id: usize,
         stack_size: usize,
         privileged: bool,
-        pri_rx: channel::Receiver<Message>,
-        rx: channel::Receiver<Message>,
-        graveyard: Arc<RwLock<HashSet<usize>>>,
-        max_idle: Arc<AtomicUsize>,
-        pool_status: Arc<AtomicU8>,
+        rx_pair: (channel::Receiver<Message>, channel::Receiver<Message>),
+        shared_info: (Arc<RwLock<HashSet<usize>>>, Arc<AtomicUsize>, Arc<AtomicU8>),  // (graveyard, max_idle, pool_status)
         behavior_definition: &StatusBehaviors,
     ) -> Worker
     {
         behavior_definition.before_start(my_id);
 
         let worker: thread::JoinHandle<()> = Self::spawn_worker(
-            name, my_id, stack_size, privileged, pri_rx, rx, graveyard, max_idle, pool_status
+            name, my_id, stack_size, privileged, rx_pair, shared_info
         );
 
         behavior_definition.after_start(my_id);
@@ -89,11 +86,8 @@ impl Worker {
         my_id: usize,
         stack_size: usize,
         privileged: bool,
-        pri_rx: channel::Receiver<Message>,
-        rx: channel::Receiver<Message>,
-        graveyard: Arc<RwLock<HashSet<usize>>>,
-        max_idle: Arc<AtomicUsize>,
-        pool_status: Arc<AtomicU8>,
+        rx_pair: (channel::Receiver<Message>, channel::Receiver<Message>),
+        shared_info: (Arc<RwLock<HashSet<usize>>>, Arc<AtomicUsize>, Arc<AtomicU8>),
     ) -> thread::JoinHandle<()>
     {
         let mut builder = thread::Builder::new();
@@ -119,6 +113,9 @@ impl Worker {
                 Some(SystemTime::now())
             };
 
+            // deconstruct the shared info bundle
+            let (graveyard, max_idle, pool_status) = shared_info;
+
             // main worker loop
             loop {
                 // get ready to take new work from the channel
@@ -131,7 +128,7 @@ impl Worker {
                 // get the pool status code
                 status = pool_status.load(Ordering::Acquire);
                 if status == FLAG_FORCE_CLOSE
-                    || (status == FLAG_CLOSING && pri_rx.is_empty() && rx.is_empty())
+                    || (status == FLAG_CLOSING && rx_pair.0.is_empty() && rx_pair.1.is_empty())
                 {
                     // if shutting down, check if we can abandon all work by checking forced
                     // close flag, or when all work have been processed.
@@ -141,7 +138,7 @@ impl Worker {
                 // wait for work loop
                 let (work, target) =
                     match Worker::check_queues(
-                        my_id, &pri_rx, &rx, &mut pri_work_count
+                        my_id, &rx_pair.0, &rx_pair.1, &mut pri_work_count
                     )
                     {
                         // if the channels are disconnected, return

@@ -5,7 +5,7 @@ use crossbeam_channel::Receiver;
 use hashbrown::HashSet;
 use parking_lot::RwLock;
 use crate::debug::is_debug_mode;
-use crate::model::{Message, WorkerUpdate, FLAG_NORMAL, FLAG_HIBERNATING, FLAG_CLOSING, FLAG_FORCE_CLOSE};
+use crate::model::{Message, WorkerUpdate};
 use crate::worker::Worker;
 use crate::Config;
 use crate::config::ConfigStatus;
@@ -21,7 +21,6 @@ pub(crate) struct Manager {
     last_worker_id: usize,
     graveyard: Arc<RwLock<HashSet<usize>>>,
     max_idle: Arc<AtomicUsize>,
-    inner_status: Arc<AtomicU8>,
     chan: (Receiver<Message>, Receiver<Message>),
 }
 
@@ -29,6 +28,7 @@ impl Manager {
     pub(crate) fn build(
         config: Config,
         range: usize,
+        status: Arc<AtomicU8>,
         pri_rx: Receiver<Message>,
         rx: Receiver<Message>,
         lazy_built: bool,
@@ -40,12 +40,11 @@ impl Manager {
             last_worker_id: INIT_ID,
             graveyard: Arc::new(RwLock::new(HashSet::new())),
             max_idle: Arc::new(AtomicUsize::new(0)),
-            inner_status: Arc::new(AtomicU8::new(FLAG_NORMAL)),
             chan: (pri_rx, rx),
         };
 
         if !lazy_built {
-            m.add_workers(range, true);
+            m.add_workers(range, true, status);
             m.graveyard.write().reserve(range);
 
             if is_debug_mode() {
@@ -56,19 +55,9 @@ impl Manager {
         m
     }
 
-    pub(crate) fn propagate_status(&mut self, new_status: u8) {
-        if new_status == FLAG_NORMAL
-            || new_status == FLAG_HIBERNATING
-            || new_status == FLAG_CLOSING
-            || new_status == FLAG_FORCE_CLOSE
-        {
-            self.inner_status.store(new_status, Ordering::Release);
-        }
-    }
-
     pub(crate) fn remove_all(&mut self, sync_remove: bool) {
         // nothing to remove now
-        if self.workers.len() == 0 {
+        if self.workers.is_empty() {
             return;
         }
 
@@ -98,7 +87,7 @@ impl Manager {
         self.last_worker_id = INIT_ID;
     }
 
-    pub(crate) fn add_workers(&mut self, count: usize, privileged: bool) {
+    pub(crate) fn add_workers(&mut self, count: usize, privileged: bool, status: Arc<AtomicU8>) {
         if count == 0 {
             return;
         }
@@ -132,11 +121,12 @@ impl Manager {
                     id,
                     stack_size,
                     privileged,
-                    pri_rx,
-                    rx,
-                    Arc::clone(&self.graveyard),
-                    Arc::clone(&self.max_idle),
-                    Arc::clone(&self.inner_status),
+                    (pri_rx, rx),
+                    (
+                        Arc::clone(&self.graveyard),
+                        Arc::clone(&self.max_idle),
+                        Arc::clone(&status)
+                    ),
                     self.config.worker_behavior()
                 )
             );
@@ -190,7 +180,7 @@ impl Manager {
 pub(crate) trait WorkerManagement {
     fn workers_count(&self) -> usize;
     fn worker_auto_expire(&mut self, life_in_millis: usize);
-    fn extend_by(&mut self, more: usize);
+    fn extend_by(&mut self, more: usize, status: Arc<AtomicU8>);
     fn shrink_by(&mut self, less:usize) -> Vec<usize>;
     fn dismiss_worker(&mut self, id: usize) -> Option<usize>;
     fn first_worker_id(&self) -> usize;
@@ -207,8 +197,8 @@ impl WorkerManagement for Manager {
         self.max_idle.swap(life_in_millis, Ordering::SeqCst);
     }
 
-    fn extend_by(&mut self, more: usize) {
-        self.add_workers(more, true);
+    fn extend_by(&mut self, more: usize, status: Arc<AtomicU8>) {
+        self.add_workers(more, true, status);
     }
 
     fn shrink_by(&mut self, less: usize) -> Vec<usize> {

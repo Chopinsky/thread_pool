@@ -3,18 +3,21 @@
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
+//use std::mem::MaybeUninit;
 
-use parking_lot::{Once, ONCE_INIT};
+use parking_lot::{Once, OnceState, ONCE_INIT};
 use crate::config::{Config, ConfigStatus};
 use crate::debug::is_debug_mode;
 use crate::scheduler::{PoolManager, ThreadPool};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 static ONCE: Once = ONCE_INIT;
+static CLOSING: AtomicBool = AtomicBool::new(false);
 static mut POOL: Option<Pool> = None;
+//static mut S_POOL: MaybeUninit<Pool> = MaybeUninit::new(Pool::default());
 
 struct Pool {
     store: ThreadPool,
-    closing: bool,
     auto_mode: bool,
     auto_adjust_handler: Option<JoinHandle<()>>,
 }
@@ -22,12 +25,11 @@ struct Pool {
 impl Pool {
     #[inline]
     fn inner() -> Option<&'static mut Pool> {
-        unsafe { POOL.as_mut() }
-    }
-
-    #[inline]
-    fn is_some() -> bool {
-        unsafe { POOL.is_some() }
+        if !CLOSING.load(Ordering::Acquire) {
+            unsafe { POOL.as_mut() }
+        } else {
+            None
+        }
     }
 
     #[inline]
@@ -43,8 +45,19 @@ impl Pool {
 
 impl Drop for Pool {
     fn drop(&mut self) {
-        if !self.closing {
+        if !CLOSING.load(Ordering::Acquire) {
+            // don't double drop
             close();
+        }
+    }
+}
+
+impl Default for Pool {
+    fn default() -> Self {
+        Pool {
+            store: ThreadPool::build(1),
+            auto_mode: false,
+            auto_adjust_handler: None,
         }
     }
 }
@@ -61,7 +74,7 @@ pub fn initialize_with_auto_adjustment(size: usize, period: Option<Duration>) {
 }
 
 pub fn init_with_config(size: usize, config: Config) {
-    assert!(!Pool::is_some(), "You are trying to initialize the thread pools multiple times!");
+    assert_eq!(ONCE.state(), OnceState::New, "The pool has already been initialized...");
 
     let pool_size = match size {
         0 => 1,
@@ -76,17 +89,9 @@ pub fn init_with_config(size: usize, config: Config) {
 pub fn run<F: FnOnce() + Send + 'static>(f: F) {
     match Pool::inner() {
         Some(pool) => {
-            // if pool has been created, execute in proper mode.
-            if pool.closing && is_debug_mode() {
-                eprintln!("Trying to run jobs when the pool is closing...");
-                return;
-            }
-
             if pool.store.exec(f, true).is_err() && is_debug_mode() {
                 eprintln!("The execution of this job has failed...");
             }
-
-            return;
         },
         None => {
             // This could happen after the pool is closed, just execute the job
@@ -100,17 +105,11 @@ pub fn run<F: FnOnce() + Send + 'static>(f: F) {
 }
 
 pub fn close() {
-    if let Some(mut pool) = unsafe { POOL.take() } {
-        pool.closing = true;
-        pool.store.close();
-    }
+    shut_down(false);
 }
 
 pub fn force_close() {
-    if let Some(mut pool) = unsafe { POOL.take() } {
-        pool.closing = true;
-        pool.store.force_close();
-    }
+    shut_down(true);
 }
 
 pub fn resize(size: usize) -> JoinHandle<()> {
@@ -204,16 +203,41 @@ fn create(size: usize, config: Config) {
         };
 
     // Make the pool
-    let mut store = ThreadPool::new_with_config(size, config);
+    let mut store = ThreadPool::new_with_config(size, config.clone());
     store.toggle_auto_scale(auto_mode);
 
     // Put it in the heap so it can outlive this call
     unsafe {
         POOL.replace(Pool {
             store,
-            closing: false,
             auto_mode,
             auto_adjust_handler: handler,
         });
+
+//        S_POOL.as_mut_ptr().write(Pool {
+//            store,
+//            closing: false,
+//            auto_mode,
+//            auto_adjust_handler: handler,
+//        });
     }
+}
+
+fn shut_down(forced: bool) {
+    match ONCE.state() {
+        OnceState::InProgress => panic!("The pool can't be closed while it's still being initializing..."),
+        OnceState::Done => {
+            CLOSING.store(true, Ordering::SeqCst);
+
+            if let Some(pool_inner) = Pool::inner().take() {
+                if !forced {
+                    pool_inner.store.close();
+                } else {
+                    pool_inner.store.force_close();
+                }
+            }
+        },
+        _ => return,
+    }
+
 }
