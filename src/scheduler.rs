@@ -1,5 +1,6 @@
 use std::sync::{Arc, atomic::{AtomicU8, Ordering}};
 use std::time::Duration;
+use std::thread;
 use std::vec;
 
 use crossbeam_channel as channel;
@@ -329,6 +330,7 @@ impl ThreadPool {
     fn dispatch(&self, message: Message, retry: i8, with_priority: bool)
         -> Result<bool, SendTimeoutError<Message>>
     {
+        // pick the work queue where we shall put this new job into
         let chan =
             if with_priority || (self.chan.1.is_empty() && self.chan.0.len() <= self.upgrade_threshold) {
                 // squeeze the work into the priority chan first even if some normal work is in queue
@@ -342,22 +344,30 @@ impl ThreadPool {
 
         match self.queue_timeout {
             Some(wait_period) => {
-                let factor = if retry > 0 {
-                    retry as u32
-                } else {
-                    1
-                };
+                let mut retry_message = message;
+                let mut retry = retry;
 
-                match chan.send_timeout(message, factor * wait_period) {
-                    Ok(()) => Ok(was_busy),
-                    Err(SendTimeoutError::Disconnected(msg)) => Err(SendTimeoutError::Disconnected(msg)),
-                    Err(SendTimeoutError::Timeout(msg)) => {
-                        if retry < 0 || retry > RETRY_LIMIT {
-                            return Err(SendTimeoutError::Timeout(msg));
-                        }
+                loop {
+                    match chan.send_timeout(retry_message, wait_period) {
+                        Ok(()) => {
+                            return Ok(was_busy)
+                        },
+                        Err(SendTimeoutError::Disconnected(msg)) => {
+                            return Err(SendTimeoutError::Disconnected(msg))
+                        },
+                        Err(SendTimeoutError::Timeout(msg)) => {
+                            if retry < 0 || retry >= RETRY_LIMIT {
+                                return Err(SendTimeoutError::Timeout(msg));
+                            }
 
-                        self.dispatch(msg, retry + 1, with_priority)
-                    },
+                            retry += 1;
+                            retry_message = msg;
+
+                            // yield the time slice since we've nothing left to do but to wait for
+                            // a later chance to try sending the message again.
+                            thread::yield_now();
+                        },
+                    }
                 }
             },
             None => {
