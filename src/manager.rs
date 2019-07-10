@@ -1,14 +1,13 @@
 #![allow(dead_code)]
 
-use std::sync::{atomic::{AtomicUsize, AtomicU8, Ordering}, Arc};
+use std::sync::{atomic::{AtomicUsize, AtomicI8, AtomicU8, Ordering}, Arc};
 use crossbeam_channel::Receiver;
 use hashbrown::HashSet;
 use parking_lot::RwLock;
+use crate::config::{Config, ConfigStatus};
 use crate::debug::is_debug_mode;
-use crate::model::{Message, WorkerUpdate};
+use crate::model::{Backoff, Message, WorkerUpdate, spin_update, concede_update, reset_lock};
 use crate::worker::Worker;
-use crate::Config;
-use crate::config::ConfigStatus;
 
 /// The first id that can be taken by workers. All previous ones are reserved for future use in the
 /// graveyard. Note that the `INIT_ID` is still the one reserved, and manager's first valid
@@ -18,6 +17,7 @@ const INIT_ID: usize = 15;
 pub(crate) struct Manager {
     config: Config,
     workers: Vec<Worker>,
+    mutating: AtomicI8,
     last_worker_id: usize,
     graveyard: Arc<RwLock<HashSet<usize>>>,
     max_idle: Arc<AtomicUsize>,
@@ -37,6 +37,7 @@ impl Manager {
         let mut m = Manager {
             config,
             workers: Vec::new(),
+            mutating: AtomicI8::new(0),
             last_worker_id: INIT_ID,
             graveyard: Arc::new(RwLock::new(HashSet::new())),
             max_idle: Arc::new(AtomicUsize::new(0)),
@@ -61,6 +62,9 @@ impl Manager {
             return;
         }
 
+        // wait for the in-progress process to finish
+        self.spin_update(-1);
+
         // the behaviors
         let behavior = self.config.worker_behavior();
 
@@ -82,6 +86,9 @@ impl Manager {
             }
         }
 
+        // release worker lock
+        self.reset_lock();
+
         // also clear the graveyard
         self.graveyard.write().clear();
         self.last_worker_id = INIT_ID;
@@ -95,6 +102,11 @@ impl Manager {
         if self.last_worker_id > INIT_ID {
             // before adding new workers, remove killed ones.
             self.graveyard_cleanup();
+        }
+
+        // if someone is actively adding workers, we skip this op
+        if !self.concede_update(1) {
+            return;
         }
 
         // reserve rooms for workers
@@ -132,6 +144,7 @@ impl Manager {
             );
         });
 
+        self.reset_lock();
         self.last_worker_id += count;
     }
 
@@ -163,6 +176,10 @@ impl Manager {
         let mut last = self.workers.len();
         let mut index = 0;
 
+        // make sure we've exclusive lock before modifying the workers vec
+        self.spin_update(-1);
+
+        // updating the workers vec
         while index < last {
             if g.contains(&self.workers[index].get_id()) {
                 last -= 1;
@@ -174,6 +191,9 @@ impl Manager {
 
             index += 1;
         }
+
+        // return the lock back
+        self.reset_lock();
     }
 }
 
@@ -209,7 +229,12 @@ impl WorkerManagement for Manager {
         let mut g = self.graveyard.write();
         let start = self.workers.len() - less;
 
-        self.workers
+        // make sure we've exclusive lock before modifying the workers vec
+        if !self.concede_update(-1) {
+            return Vec::new();
+        }
+
+        let workers = self.workers
             .drain(start..)
             .map(|w| {
                 w.wake_up();
@@ -217,7 +242,10 @@ impl WorkerManagement for Manager {
                 g.insert(id);
                 id
             })
-            .collect()
+            .collect();
+
+        self.reset_lock();
+        workers
     }
 
     fn dismiss_worker(&mut self, id: usize) -> Option<usize> {
@@ -229,8 +257,11 @@ impl WorkerManagement for Manager {
                 // make sure the worker is awaken and hence can go away
                 worker.wake_up();
 
-                // swap out the worker, use swap_remove for better performance.
+                // get the lock, swap out the worker, use swap_remove for better performance.
+                self.spin_update(-1);
                 res.replace(self.workers.swap_remove(idx).get_id());
+                self.reset_lock();
+
                 break;
             }
         }
@@ -270,6 +301,21 @@ impl WorkerManagement for Manager {
         }
 
         0
+    }
+}
+
+impl Backoff for Manager {
+    fn spin_update(&self, new: i8) {
+        spin_update(&self.mutating, new);
+    }
+
+    fn concede_update(&self, new: i8) -> bool {
+        concede_update(&self.mutating, new)
+    }
+
+    #[inline(always)]
+    fn reset_lock(&self) {
+        reset_lock(&self.mutating)
     }
 }
 

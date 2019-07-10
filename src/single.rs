@@ -1,15 +1,14 @@
 #![allow(dead_code)]
 
+//use std::mem::MaybeUninit;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
-//use std::mem::MaybeUninit;
-
 use parking_lot::{Once, OnceState, ONCE_INIT};
 use crate::config::{Config, ConfigStatus};
 use crate::debug::is_debug_mode;
 use crate::scheduler::{PoolManager, ThreadPool};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 static ONCE: Once = ONCE_INIT;
 static CLOSING: AtomicBool = AtomicBool::new(false);
@@ -26,6 +25,16 @@ impl Pool {
     #[inline]
     fn inner() -> Option<&'static mut Pool> {
         if !CLOSING.load(Ordering::Acquire) {
+            unsafe { POOL.as_mut() }
+        } else {
+            None
+        }
+    }
+
+    fn take() -> Option<&'static mut Pool> {
+        if CLOSING.compare_exchange_weak(
+            false, true, Ordering::SeqCst, Ordering::Relaxed
+        ) == Ok(false) {
             unsafe { POOL.as_mut() }
         } else {
             None
@@ -216,7 +225,6 @@ fn create(size: usize, config: Config) {
 
 //        S_POOL.as_mut_ptr().write(Pool {
 //            store,
-//            closing: false,
 //            auto_mode,
 //            auto_adjust_handler: handler,
 //        });
@@ -227,9 +235,7 @@ fn shut_down(forced: bool) {
     match ONCE.state() {
         OnceState::InProgress => panic!("The pool can't be closed while it's still being initializing..."),
         OnceState::Done => {
-            CLOSING.store(true, Ordering::SeqCst);
-
-            if let Some(pool_inner) = Pool::inner().take() {
+            if let Some(pool_inner) = Pool::take() {
                 if !forced {
                     pool_inner.store.close();
                 } else {
@@ -239,5 +245,4 @@ fn shut_down(forced: bool) {
         },
         _ => return,
     }
-
 }

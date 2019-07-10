@@ -1,21 +1,23 @@
 #![allow(dead_code)]
 
+use std::sync::atomic::{AtomicBool, AtomicI8, Ordering};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
-
 use hashbrown::{HashMap, HashSet};
-use parking_lot::{Once, ONCE_INIT};
+use parking_lot::{Once, OnceState, ONCE_INIT};
 use crate::config::{Config, ConfigStatus};
-use crate::scheduler::{PoolManager, PoolState, ThreadPool};
 use crate::debug::is_debug_mode;
+use crate::model::{Backoff, spin_update, concede_update, reset_lock};
+use crate::scheduler::{PoolManager, PoolState, ThreadPool};
 
 static ONCE: Once = ONCE_INIT;
+static CLOSING: AtomicBool = AtomicBool::new(false);
 static mut MULTI_POOL: Option<PoolStore> = None;
 
 struct PoolStore {
     store: HashMap<String, ThreadPool>,
-    closing: bool,
+    mutating: AtomicI8,
     auto_adjust_period: Option<Duration>,
     auto_adjust_handler: Option<JoinHandle<()>>,
     auto_adjust_register: HashSet<String>,
@@ -24,20 +26,46 @@ struct PoolStore {
 impl PoolStore {
     #[inline]
     fn inner() -> Option<&'static mut PoolStore> {
-        unsafe { MULTI_POOL.as_mut() }
+        unsafe {
+            if !CLOSING.load(Ordering::Acquire) {
+                MULTI_POOL.as_mut()
+            } else {
+                None
+            }
+        }
     }
 
-    #[inline]
-    fn is_some() -> bool {
-        unsafe { MULTI_POOL.is_some() }
+    fn take() -> Option<&'static mut PoolStore> {
+        if CLOSING.compare_exchange_weak(
+            false, true, Ordering::SeqCst, Ordering::Relaxed
+        ) == Ok(false) {
+            unsafe { MULTI_POOL.as_mut() }
+        } else {
+            None
+        }
     }
 }
 
 impl Drop for PoolStore {
     fn drop(&mut self) {
-        if !self.closing {
-            close();
+        if !CLOSING.load(Ordering::Acquire) {
+            shut_down(false);
         }
+    }
+}
+
+impl Backoff for PoolStore {
+    fn spin_update(&self, new: i8) {
+        spin_update(&self.mutating, new);
+    }
+
+    fn concede_update(&self, new: i8) -> bool {
+        concede_update(&self.mutating, new)
+    }
+
+    #[inline(always)]
+    fn reset_lock(&self) {
+        reset_lock(&self.mutating)
     }
 }
 
@@ -63,7 +91,7 @@ pub fn init_with_config<S>(keys: std::collections::HashMap<String, usize, S>, co
         return;
     }
 
-    assert!(!PoolStore::is_some(), "You are trying to initialize the thread pools multiple times!");
+    assert_eq!(ONCE.state(), OnceState::New, "The pool has already been initialized...");
 
     // copy to more efficient structure
     let mut map = HashMap::with_capacity(keys.len());
@@ -79,19 +107,13 @@ pub fn init_with_config<S>(keys: std::collections::HashMap<String, usize, S>, co
 pub fn run_with<F: FnOnce() + Send + 'static>(key: String, f: F) {
     match PoolStore::inner() {
         Some(pool) => {
-            // if pool has been created, execute in proper mode.
-            if pool.closing && is_debug_mode() {
-                eprintln!("Trying to run jobs when the pool is closing...");
-                return;
-            }
-
             // if pool has been created
             if let Some(p) = pool.store.get_mut(&key) {
-                if p.exec(f, false).is_err() && is_debug_mode() {
+                if p.exec(f, true).is_err() && is_debug_mode() {
                     eprintln!("The execution of this job has failed...");
                 }
-
-                return;
+            } else if is_debug_mode() {
+                eprintln!("Unable to identify the pool with given key: {}", key);
             }
         },
         None => {
@@ -101,26 +123,16 @@ pub fn run_with<F: FnOnce() + Send + 'static>(key: String, f: F) {
             if is_debug_mode() {
                 eprintln!("The pool has been poisoned... The thread pool should be restarted...");
             }
-        }
+        },
     };
 }
 
 pub fn close() {
-    if let Some(pool) = unsafe { MULTI_POOL.take().as_mut() } {
-        pool.closing = true;
-        for (_, p) in pool.store.iter_mut() {
-            p.close();
-        }
-    }
+    shut_down(false);
 }
 
 pub fn force_close() {
-    if let Some(pool) = unsafe { MULTI_POOL.take().as_mut() } {
-        pool.closing = true;
-        for (_, p) in pool.store.iter_mut() {
-            p.force_close();
-        }
-    }
+    shut_down(true);
 }
 
 pub fn resize_pool(pool_key: String, size: usize) {
@@ -130,8 +142,8 @@ pub fn resize_pool(pool_key: String, size: usize) {
 
     thread::spawn(move || {
         if let Some(pools) = PoolStore::inner() {
-            if let Some(pool_info) = pools.store.get_mut(&pool_key) {
-                pool_info.resize(size);
+            if let Some(pool_inner) = pools.store.get_mut(&pool_key) {
+                pool_inner.resize(size);
             }
         }
     });
@@ -146,9 +158,12 @@ pub fn remove_pool(key: String) -> Option<JoinHandle<()>> {
 
     let handler = thread::spawn(move || {
         if let Some(pools) = PoolStore::inner() {
-            if let Some(mut pool_info) = pools.store.remove(&key) {
-                pool_info.close();
+            pools.concede_update(-1);
+            if let Some(mut pool_inner) = pools.store.remove(&key) {
+                pool_inner.close();
             }
+
+            pools.reset_lock();
         }
     });
 
@@ -162,6 +177,8 @@ pub fn add_pool(key: String, size: usize) -> Option<JoinHandle<()>> {
 
     let handler = thread::spawn(move || {
         if let Some(pools) = PoolStore::inner() {
+            pools.concede_update(1);
+
             if let Some(pool_info) = pools.store.get_mut(&key) {
                 if pool_info.get_size() != size {
                     pool_info.resize(size);
@@ -170,6 +187,7 @@ pub fn add_pool(key: String, size: usize) -> Option<JoinHandle<()>> {
             }
 
             pools.store.insert(key, ThreadPool::new(size));
+            pools.reset_lock();
         }
     });
 
@@ -192,9 +210,9 @@ fn create<S>(keys: HashMap<String, usize, S>, config: Config)
 
     unsafe {
         // Put it in the heap so it can outlive this call
-        MULTI_POOL = Some(PoolStore {
+        MULTI_POOL.replace(PoolStore {
             store,
-            closing: false,
+            mutating: AtomicI8::new(0),
             auto_adjust_period: config.refresh_period(),
             auto_adjust_handler: None,
             auto_adjust_register: HashSet::with_capacity(size),
@@ -307,9 +325,29 @@ fn trigger_auto_adjustment() {
         }
 
         for key in pools.auto_adjust_register.iter() {
-            if let Some(pool_info) = pools.store.get_mut(key) {
-                pool_info.auto_adjust();
+            if let Some(pool) = pools.store.get_mut(key) {
+                pool.auto_adjust();
             }
         }
+    }
+}
+
+fn shut_down(forced: bool) {
+    match ONCE.state() {
+        OnceState::InProgress => panic!("The pool can't be closed while it's still being initializing..."),
+        OnceState::Done => {
+            if let Some(pool_inner) = PoolStore::take() {
+                pool_inner.store
+                    .values_mut()
+                    .for_each(|pool| {
+                        if !forced {
+                            pool.close();
+                        } else {
+                            pool.force_close();
+                        }
+                    });
+            }
+        },
+        _ => return,
     }
 }
