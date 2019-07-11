@@ -98,7 +98,7 @@ pub fn init_with_config(size: usize, config: Config) {
 pub fn run<F: FnOnce() + Send + 'static>(f: F) {
     match Pool::inner() {
         Some(pool) => {
-            if pool.store.exec(f, true).is_err() && is_debug_mode() {
+            if pool.store.exec(f, false).is_err() && is_debug_mode() {
                 eprintln!("The execution of this job has failed...");
             }
         },

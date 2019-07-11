@@ -109,7 +109,7 @@ pub fn run_with<F: FnOnce() + Send + 'static>(key: String, f: F) {
         Some(pool) => {
             // if pool has been created
             if let Some(p) = pool.store.get_mut(&key) {
-                if p.exec(f, true).is_err() && is_debug_mode() {
+                if p.exec(f, false).is_err() && is_debug_mode() {
                     eprintln!("The execution of this job has failed...");
                 }
             } else if is_debug_mode() {
