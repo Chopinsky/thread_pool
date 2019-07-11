@@ -6,7 +6,7 @@ use hashbrown::HashSet;
 use parking_lot::RwLock;
 use crate::config::{Config, ConfigStatus};
 use crate::debug::is_debug_mode;
-use crate::model::{Backoff, Message, WorkerUpdate, spin_update, concede_update, reset_lock};
+use crate::model::{EXPIRE_PERIOD, Backoff, Message, WorkerUpdate, spin_update, concede_update, reset_lock};
 use crate::worker::Worker;
 
 /// The first id that can be taken by workers. All previous ones are reserved for future use in the
@@ -40,7 +40,7 @@ impl Manager {
             mutating: AtomicI8::new(0),
             last_worker_id: INIT_ID,
             graveyard: Arc::new(RwLock::new(HashSet::new())),
-            max_idle: Arc::new(AtomicUsize::new(0)),
+            max_idle: Arc::new(AtomicUsize::new(EXPIRE_PERIOD)),
             chan: (pri_rx, rx),
         };
 
@@ -301,6 +301,60 @@ impl WorkerManagement for Manager {
         }
 
         0
+    }
+}
+
+pub(crate) trait JobManagement {
+    fn drop_one(&self, from: u8) -> usize;
+    fn drop_many(&self, from: u8, target: usize) -> usize;
+}
+
+impl JobManagement for Manager {
+    fn drop_one(&self, from: u8) -> usize {
+        let chan = if from == 0 {
+            // pop one task from the priority queue
+            &self.chan.0
+        } else {
+            // pop one task from the normal queue
+            &self.chan.1
+        };
+
+        if chan.is_empty() {
+            return 0;
+        }
+
+        if chan.try_recv().is_err() {
+            return 0;
+        }
+
+        1
+    }
+
+    fn drop_many(&self, from: u8, target: usize) -> usize {
+        let chan = if from == 0 {
+            // pop one task from the priority queue
+            &self.chan.0
+        } else {
+            // pop one task from the normal queue
+            &self.chan.1
+        };
+
+        if chan.is_empty() {
+            return 0;
+        }
+
+        let mut count = 0;
+        while count < target {
+            // empty or disconnected, we're done either way
+            if chan.try_recv().is_err() {
+                break;
+            }
+
+            // update the counter
+            count += 1;
+        }
+
+        count
     }
 }
 

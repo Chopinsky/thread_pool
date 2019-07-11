@@ -1,16 +1,15 @@
 use std::sync::{Arc, atomic::{AtomicU8, Ordering}};
 use std::time::Duration;
-use std::thread;
 use std::vec;
 
 use crossbeam_channel as channel;
 use crossbeam_channel::{Sender, SendTimeoutError, TrySendError, SendError};
-use crate::config::Config;
+use crate::config::{Config, ConfigStatus, TimeoutPolicy};
 use crate::debug::is_debug_mode;
 use crate::model::*;
 use crate::manager::*;
 
-const RETRY_LIMIT: i8 = 4;
+const RETRY_LIMIT: u8 = 4;
 const CHAN_CAP: usize = 16;
 const THRESHOLD: usize = 1024;
 const AUTO_EXTEND_TRIGGER_SIZE: usize = 2;
@@ -33,6 +32,39 @@ pub enum ExecutionError {
     PoolPoisoned,
 }
 
+/// The standalone thread pool, which gives users more controls on the pool and where the hosted pool
+/// shall live.
+///
+/// # Examples
+///
+/// ```
+/// extern crate threads_pool;
+/// use threads_pool::ThreadPool;
+/// use std::thread;
+/// use std::time::Duration;
+///
+/// // lazy-create the pool
+/// let mut pool = ThreadPool::new(4);
+///
+/// // get ready to submit parallel jobs, first of all, activate the pool. Not that this step is
+/// // optional if the caller will only use the `exec` API to submit jobs.
+/// pool.execute(|| {
+///     // this closure could cause panic if the pool has not been activated yet.
+///     println!("Executing jobs ... ");
+/// });
+///
+/// // do parallel stuff.
+/// for id in 0..10 {
+///     // even `id` jobs always get prioritized
+///     let priority = if id % 2 == 0 { true } else { false };
+///
+///     // API `exec` can set if a job needs to be prioritized for execution or not.
+///     pool.exec(|| {
+///         thread::sleep(Duration::from_secs(1));
+///         println!("thread {} has slept for around 1 second ... ", id);
+///     }, priority);
+/// }
+/// ```
 pub struct ThreadPool {
     /// The worker manager struct, hide details of managing workers.
     manager: Manager,
@@ -73,6 +105,14 @@ pub struct ThreadPool {
     /// in blocking mode, or return with error immediately if in the non-blocking mode (i.e.
     /// `non_blocking` field set to `true`).
     queue_timeout: Option<Duration>,
+
+    /// Determine the timeout policy when the queue is full and we have timed out on sending the job:
+    ///     1. Drop       -> (default behavior) The job will be dropped.
+    ///     2. DirectRun  -> The job will be run in the current thread and will keep blocking the
+    ///                      caller until the job is done.
+    ///     3. LossyRetry -> If we choose to drop oldest tasks when the pool is full, such that we
+    ///                      will not block the channels;
+    timeout_policy: TimeoutPolicy,
 }
 
 impl ThreadPool {
@@ -248,9 +288,9 @@ impl ThreadPool {
 
         // if we can auto scale the pool, set the retry stack limit
         let retry = if self.auto_scale {
-            0
+            1
         } else {
-            -1
+            0
         };
 
         // send the job for execution
@@ -317,7 +357,7 @@ impl ThreadPool {
         // send the job to the queue for execution. note that if we're in hibernation, the queue
         // will still take the new job, though no worker will be awaken to take the job.
         let prioritized = self.chan.1.is_empty() && !self.chan.0.is_full();
-        self.dispatch(Message::NewJob(Box::new(f)), -1, prioritized)
+        self.dispatch(Message::NewJob(Box::new(f)), 0, prioritized)
             .map(|_| {})
             .map_err(|err| {
                 match err {
@@ -327,66 +367,36 @@ impl ThreadPool {
             })
     }
 
-    fn dispatch(&self, message: Message, retry: i8, with_priority: bool)
+    fn dispatch(&self, message: Message, retry: u8, with_priority: bool)
         -> Result<bool, SendTimeoutError<Message>>
     {
         // pick the work queue where we shall put this new job into
-        let chan =
+        let (chan, chan_id) =
             if with_priority || (self.chan.1.is_empty() && self.chan.0.len() <= self.upgrade_threshold) {
                 // squeeze the work into the priority chan first even if some normal work is in queue
-                &self.chan.0
+                (&self.chan.0, 0)
             } else {
                 // normal work and then priority queue is full
-                &self.chan.1
+                (&self.chan.1, 1)
             };
 
-        let was_busy = chan.is_full();
-
-        match self.queue_timeout {
-            Some(wait_period) => {
-                let mut retry_message = message;
-                let mut retry = retry;
-
-                loop {
-                    match chan.send_timeout(retry_message, wait_period) {
-                        Ok(()) => {
-                            return Ok(was_busy)
-                        },
-                        Err(SendTimeoutError::Disconnected(msg)) => {
-                            return Err(SendTimeoutError::Disconnected(msg))
-                        },
-                        Err(SendTimeoutError::Timeout(msg)) => {
-                            if retry < 0 || retry >= RETRY_LIMIT {
-                                return Err(SendTimeoutError::Timeout(msg));
-                            }
-
-                            retry += 1;
-                            retry_message = msg;
-
-                            // yield the time slice since we've nothing left to do but to wait for
-                            // a later chance to try sending the message again.
-                            thread::yield_now();
-                        },
-                    }
-                }
+        let res = match self.queue_timeout {
+            Some(period) => {
+                // spin and retry to send the message on timeout
+                self.send_timeout((chan, chan_id), message, period, retry)
             },
             None => {
                 if !self.non_blocking {
                     // wait until a worker is ready to take new work
-                    match chan.send(message) {
-                        Ok(()) => Ok(was_busy),
-                        Err(SendError(msg)) => Err(SendTimeoutError::Disconnected(msg)),
-                    }
+                    self.send(chan, message)
                 } else {
-                    // timeout immediately if all workers are busy
-                    match chan.try_send(message) {
-                        Ok(()) => Ok(was_busy),
-                        Err(TrySendError::Disconnected(msg)) => Err(SendTimeoutError::Disconnected(msg)),
-                        Err(TrySendError::Full(msg)) => Err(SendTimeoutError::Timeout(msg)),
-                    }
+                    // try send and return (almost) immediately if failed or succeeded
+                    self.try_send((chan, chan_id), message)
                 }
             }
-        }
+        };
+
+        res.map(|_| chan.is_full())
     }
 
     fn resize_target(&self, queue_length: usize) -> Option<usize> {
@@ -441,7 +451,9 @@ impl ThreadPool {
 
         let (tx, rx) = channel::bounded(CHAN_CAP);
         let (pri_tx, pri_rx) = channel::bounded(CHAN_CAP);
+
         let non_blocking = config.non_blocking();
+        let policy = config.timeout_policy();
 
         let flag =
             Arc::new(AtomicU8::new(
@@ -468,6 +480,7 @@ impl ThreadPool {
             auto_scale: false,
             non_blocking,
             queue_timeout: None,
+            timeout_policy: policy,
         }
     }
 }
@@ -522,18 +535,33 @@ pub trait ThreadPoolStates {
 }
 
 impl ThreadPoolStates for ThreadPool {
+    /// Set the job timeout period.
+    ///
+    /// The timeout period is mainly for dropping jobs when the thread pool is under
+    /// pressure, i.e. the producer creates new work faster than the consumer can handle them. When
+    /// the job queue buffer is full, any additional jobs will be dropped after the timeout period.
+    /// Set the `timeout` parameter to `None` to turn this feature off, which is the default behavior.
+    /// Note that if the timeout is turned off, sending new jobs to the full pool will block the
+    /// caller until some space is freed up in the work queue.
     fn set_exec_timeout(&mut self, timeout: Option<Duration>) {
         self.queue_timeout = timeout;
     }
 
+    /// Check the currently set timeout period. If the result is `None`, it means we will not timeout
+    /// on submitted jobs when the job queue is full, which implies the caller will be blocked until
+    /// some space in the queue is freed up
     fn get_exec_timeout(&self) -> Option<Duration> {
         self.queue_timeout
     }
 
+    /// Toggle if we shall scale the pool automatically when the pool is under pressure, i.e. adding
+    /// more threads to the pool to take the jobs. These temporarily added threads will go away once
+    /// the pool is able to keep up with the new jobs to release resources.
     fn toggle_auto_scale(&mut self, auto_scale: bool) {
         self.auto_scale = auto_scale;
     }
 
+    /// Check if the auto-scale feature is turned on or not
     fn auto_scale_enabled(&self) -> bool {
         self.auto_scale
     }
@@ -697,6 +725,108 @@ impl PoolState for ThreadPool {
         match self.manager.next_worker_id(current_id) {
             0 => None,
             id => Some(id),
+        }
+    }
+}
+
+trait DispatchFlavors {
+    fn send_timeout(&self, chan: (&Sender<Message>, u8), message: Message, timeout: Duration, retry: u8)
+        -> Result<(), SendTimeoutError<Message>>;
+    fn send(&self, chan: &Sender<Message>, message: Message)
+        -> Result<(), SendTimeoutError<Message>>;
+    fn try_send(&self, chan: (&Sender<Message>, u8), message: Message)
+        -> Result<(), SendTimeoutError<Message>>;
+}
+
+impl DispatchFlavors for ThreadPool {
+    fn send_timeout(&self, chan: (&Sender<Message>, u8), message: Message, timeout: Duration, retry: u8)
+        -> Result<(), SendTimeoutError<Message>>
+    {
+        let mut retry_message = message;
+        let mut retry = retry;
+
+        loop {
+            match chan.0.send_timeout(retry_message, timeout) {
+                Ok(()) => {
+                    return Ok(())
+                },
+                Err(SendTimeoutError::Disconnected(msg)) => {
+                    return Err(SendTimeoutError::Disconnected(msg))
+                },
+                Err(SendTimeoutError::Timeout(msg)) => {
+                    retry_message = msg;
+
+                    // if we use a lossy channel, always try to drop messages and try sending
+                    // again, even if it means we need to clear the channel (i.e. too many
+                    // retries...). Otherwise, check if we shall keep retrying.
+                    match self.timeout_policy {
+                        TimeoutPolicy::LossyRetry => {
+                            // make space for new job submission(s). if a termination message
+                            // is dropped, it should be fine since we need hands to get things
+                            // done at the moment. Balancing or releasing resources can happen
+                            // later.
+                            self.manager.drop_many(chan.1, retry as usize);
+                        },
+                        TimeoutPolicy::DirectRun => {
+                            // directly run the job; the termination message will not be
+                            // sent in this workflow, so we shall not worry about that.
+                            if let Message::NewJob(job) = retry_message {
+                                job.call_box();
+                            }
+
+                            // done with it
+                            return Ok(());
+                        },
+                        TimeoutPolicy::Drop => {
+                            // done with the retry (or not allowed), return and drop the job
+                            if retry == 0 || retry > RETRY_LIMIT {
+                                return Err(SendTimeoutError::Timeout(retry_message));
+                            }
+                        }
+                    }
+
+                    // if we shall try again, update the counter
+                    retry += 1;
+                },
+            }
+        }
+    }
+
+    fn send(&self, chan: &Sender<Message>, message: Message)
+        -> Result<(), SendTimeoutError<Message>>
+    {
+        match chan.send(message) {
+            Ok(()) => Ok(()),
+            Err(SendError(msg)) => Err(SendTimeoutError::Disconnected(msg)),
+        }
+    }
+
+    fn try_send(&self, chan: (&Sender<Message>, u8), message: Message)
+        -> Result<(), SendTimeoutError<Message>>
+    {
+        // timeout immediately if all workers are busy
+        match chan.0.try_send(message) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Disconnected(msg)) => Err(SendTimeoutError::Disconnected(msg)),
+            Err(TrySendError::Full(msg)) => {
+                if let TimeoutPolicy::LossyRetry = self.timeout_policy {
+                    // drop a message and try again, just once
+                    self.manager.drop_one(chan.1);
+
+                    // send the message again and hopefully no one else take the space
+                    chan.0
+                        .try_send(msg)
+                        .map_err(|err| {
+                            match err {
+                                TrySendError::Disconnected(msg) => SendTimeoutError::Disconnected(msg),
+                                TrySendError::Full(msg) => SendTimeoutError::Timeout(msg),
+                            }
+                        })
+                } else {
+                    // unable to send the job
+                    Err(SendTimeoutError::Timeout(msg))
+                }
+            }
         }
     }
 }

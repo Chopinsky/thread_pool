@@ -18,5 +18,5 @@ pub mod index_mode {
 pub use crate::{
     scheduler::{ExecutionError, Hibernation, PoolManager, PoolState, ThreadPool, ThreadPoolStates},
     manager::{StatusBehaviors, StatusBehaviorSetter},
-    config::{Config, ConfigStatus},
+    config::{Config, ConfigStatus, TimeoutPolicy},
 };

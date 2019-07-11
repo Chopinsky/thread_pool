@@ -7,7 +7,7 @@ pub(crate) const FLAG_CLOSING: u8 = 1;
 pub(crate) const FLAG_FORCE_CLOSE: u8 = 2;
 pub(crate) const FLAG_HIBERNATING: u8 = 4;
 pub(crate) const FLAG_LAZY_INIT: u8 = 8;
-
+pub(crate) const EXPIRE_PERIOD: usize = 64;
 const BACKOFF_RETRY_LIMIT: usize = 16;
 
 // Enum ...
@@ -38,6 +38,7 @@ impl<F: FnOnce()> FnBox for F {
     }
 }
 
+// Shared utilities
 pub(crate) fn spin_update(state: &AtomicI8, new: i8) {
     // retry counter
     let mut retry = 0;
@@ -48,7 +49,7 @@ pub(crate) fn spin_update(state: &AtomicI8, new: i8) {
     ) != Ok(0) {
         if retry < BACKOFF_RETRY_LIMIT {
             retry += 1;
-            cpu_relax(1 << retry);
+            cpu_relax(retry);
         } else {
             thread::yield_now();
         }
@@ -77,8 +78,8 @@ pub(crate) fn reset_lock(state: &AtomicI8) {
     state.store(0, Ordering::Release);
 }
 
-fn cpu_relax(count: usize) {
-    for _ in 0..count {
+pub(crate) fn cpu_relax(count: usize) {
+    for _ in 0..(1 << count) {
         atomic::spin_loop_hint()
     }
 }
