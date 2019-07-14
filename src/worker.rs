@@ -1,21 +1,24 @@
 #![allow(dead_code)]
 
-use std::sync::{atomic::{AtomicUsize, AtomicU8, Ordering}, Arc};
+use std::sync::{
+    atomic::{AtomicU8, AtomicUsize, Ordering},
+    Arc,
+};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
-use crossbeam_channel as channel;
-use parking_lot::RwLock;
 use crate::debug::is_debug_mode;
-use crate::manager::{StatusBehaviors, StatusBehaviorDefinitions};
+use crate::manager::{StatusBehaviorDefinitions, StatusBehaviors};
 use crate::model::*;
+use crossbeam_channel as channel;
 use hashbrown::HashSet;
+use parking_lot::RwLock;
 
 const TIMEOUT: Duration = Duration::from_micros(16);
 const LONG_TIMEOUT: Duration = Duration::from_micros(96);
 const LOT_COUNTS: usize = 3;
-const LONG_PARKING_ROUNDS: u8 = 16;
-const SHORT_PARKING_ROUNDS: u8 = 4;
+const LONG_PARKING_ROUNDS: u8 = 8;
+const SHORT_PARKING_ROUNDS: u8 = 2;
 
 pub(crate) struct Worker {
     id: usize,
@@ -34,15 +37,13 @@ impl Worker {
         stack_size: usize,
         privileged: bool,
         rx_pair: (channel::Receiver<Message>, channel::Receiver<Message>),
-        shared_info: (Arc<RwLock<HashSet<usize>>>, Arc<AtomicUsize>, Arc<AtomicU8>),  // (graveyard, max_idle, pool_status)
+        shared_info: (Arc<RwLock<HashSet<usize>>>, Arc<AtomicUsize>, Arc<AtomicU8>), // (graveyard, max_idle, pool_status)
         behavior_definition: &StatusBehaviors,
-    ) -> Worker
-    {
+    ) -> Worker {
         behavior_definition.before_start(my_id);
 
-        let worker: thread::JoinHandle<()> = Self::spawn_worker(
-            name, my_id, stack_size, privileged, rx_pair, shared_info
-        );
+        let worker: thread::JoinHandle<()> =
+            Self::spawn_worker(name, my_id, stack_size, privileged, rx_pair, shared_info);
 
         behavior_definition.after_start(my_id);
 
@@ -88,14 +89,11 @@ impl Worker {
         privileged: bool,
         rx_pair: (channel::Receiver<Message>, channel::Receiver<Message>),
         shared_info: (Arc<RwLock<HashSet<usize>>>, Arc<AtomicUsize>, Arc<AtomicU8>),
-    ) -> thread::JoinHandle<()>
-    {
+    ) -> thread::JoinHandle<()> {
         let mut builder = thread::Builder::new();
 
         if name.is_some() {
-            builder = builder.name(
-                name.unwrap_or_else(|| format!("worker-{}", my_id))
-            );
+            builder = builder.name(name.unwrap_or_else(|| format!("worker-{}", my_id)));
         }
 
         if stack_size > 0 {
@@ -113,7 +111,7 @@ impl Worker {
                 Some(SystemTime::now())
             };
 
-            // deconstruct the shared info bundle
+            // unpack the shared info triple
             let (graveyard, max_idle, pool_status) = shared_info;
 
             // main worker loop
@@ -121,6 +119,7 @@ impl Worker {
                 // get ready to take new work from the channel
                 {
                     if graveyard.read().contains(&my_id) {
+                        // async universal kill, or a targeted kill, either way, we shall quit
                         return;
                     }
                 }
@@ -136,17 +135,16 @@ impl Worker {
                 }
 
                 // wait for work loop
-                let (work, target) =
-                    match Worker::check_queues(
-                        my_id, &rx_pair.0, &rx_pair.1, &mut pri_work_count
-                    )
-                    {
-                        // if the channels are disconnected, return
-                        WorkStatus(-1, _, _) => return,
-                        WorkStatus(_, job, target) => {
-                            (job, target)
-                        },
-                    };
+                let (work, target) = match Worker::check_queues(
+                    my_id,
+                    &rx_pair.0,
+                    &rx_pair.1,
+                    &mut pri_work_count,
+                ) {
+                    // if the channels are disconnected, return
+                    WorkStatus(-1, _, _) => return,
+                    WorkStatus(_, job, target) => (job, target),
+                };
 
                 // if there's a job, get it done first, and calc the idle period since last actual job
                 done = work
@@ -172,19 +170,23 @@ impl Worker {
                     })
                     .is_some();
 
-                // if it's a target kill, handle it now
+                // if not done and it's a target kill, handle it now
                 done = done || target
                     .and_then(|id_slice| {
-                        // update the graveyard
-                        let mut found = false;
+                        if id_slice.is_empty() {
+                            return None;
+                        }
 
-                        if !id_slice.is_empty() {
-                            // write and done, keep the write lock scoped
-                            let mut g = graveyard.write();
-                            for id in id_slice {
-                                g.insert(id);
-                                found = found || (id == 0 && status == FLAG_FORCE_CLOSE) || id == my_id;
-                            }
+                        // write and done, keep the write lock scoped and update the graveyard
+                        let mut found = false;
+                        let mut g = graveyard.write();
+
+                        for id in id_slice {
+                            // update graveyard for clean up purposes
+                            g.insert(id);
+
+                            // only receiving the universal kill-signal from closing the channel
+                            found = found || id == my_id;
                         }
 
                         // if my id or a forced kill, just quit
@@ -212,17 +214,14 @@ impl Worker {
         pri_chan: &channel::Receiver<Message>,
         norm_chan: &channel::Receiver<Message>,
         pri_work_count: &mut u8,
-    ) -> WorkStatus
-    {
+    ) -> WorkStatus {
         // wait for work loop, 1/3 of workers will long-park for priority work, and 1/3 of workers
         // will long-park for normal work, the remainder 1/3 workers will be fluid and constantly
         // query both queues -- whichever yield a task, then it will execute that task.
         if *pri_work_count < 255 {
             // 1/3 of the workers is designated to wait longer for prioritised jobs
             let parking = id % LOT_COUNTS == 0;
-            match Worker::fetch_work(
-                pri_chan, norm_chan.is_empty(), !parking
-            ) {
+            match Worker::fetch_work(pri_chan, norm_chan.is_empty(), !parking) {
                 Ok(message) => {
                     // message is the only place that can update the "done" field
                     let (job, target) = Worker::unpack_message(message);
@@ -238,11 +237,11 @@ impl Worker {
                     }
 
                     return WorkStatus(0, job, target);
-                },
+                }
                 Err(channel::RecvTimeoutError::Disconnected) => {
                     // sender has been dropped
                     return WorkStatus(-1, None, None);
-                },
+                }
                 Err(channel::RecvTimeoutError::Timeout) => {
                     // if chan empty, do nothing and fall through to the normal chan handle
                     // fall-through
@@ -256,20 +255,18 @@ impl Worker {
         }
 
         // 1/3 of the workers is designated to wait longer for normal jobs
-        match Worker::fetch_work(
-            norm_chan, pri_chan.is_empty(), id % LOT_COUNTS == 1
-        ) {
+        match Worker::fetch_work(norm_chan, pri_chan.is_empty(), id % LOT_COUNTS == 1) {
             Ok(message) => {
                 // message is the only place that can update the "done" field
                 let (job, target) = Worker::unpack_message(message);
                 *pri_work_count = 0;
 
                 return WorkStatus(0, job, target);
-            },
+            }
             Err(channel::RecvTimeoutError::Disconnected) => {
                 // sender has been dropped
                 return WorkStatus(-1, None, None);
-            },
+            }
             Err(channel::RecvTimeoutError::Timeout) => {
                 // nothing to receive yet
             }
@@ -281,9 +278,8 @@ impl Worker {
     fn fetch_work(
         main_chan: &channel::Receiver<Message>,
         side_chan_empty: bool,
-        can_skip: bool
-    ) -> Result<Message, channel::RecvTimeoutError>
-    {
+        can_skip: bool,
+    ) -> Result<Message, channel::RecvTimeoutError> {
         let mut wait = 0;
         let rounds = if can_skip {
             SHORT_PARKING_ROUNDS
@@ -296,13 +292,15 @@ impl Worker {
 
             match main_chan.try_recv() {
                 Ok(work) => return Ok(work),
-                Err(channel::TryRecvError::Disconnected) => return Err(channel::RecvTimeoutError::Disconnected),
+                Err(channel::TryRecvError::Disconnected) => {
+                    return Err(channel::RecvTimeoutError::Disconnected)
+                }
                 Err(channel::TryRecvError::Empty) => {
                     if can_skip && !side_chan_empty {
                         // if there're normal work in queue, break to fetch the normal work
                         return Err(channel::RecvTimeoutError::Timeout);
                     }
-                },
+                }
             }
 
             if wait > rounds {
@@ -325,12 +323,8 @@ impl Worker {
 
     fn unpack_message(message: Message) -> (Option<Job>, Option<Vec<usize>>) {
         match message {
-            Message::NewJob(job) => {
-                (Some(job), None)
-            },
-            Message::Terminate(target) => {
-                (None, Some(target))
-            }
+            Message::NewJob(job) => (Some(job), None),
+            Message::Terminate(target) => (None, Some(target)),
         }
     }
 
