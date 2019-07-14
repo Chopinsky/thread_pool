@@ -38,5 +38,5 @@ fn main() {
     shared_mode::close();
 
     println!("Elapsed time: {} ms", now.elapsed().as_millis());
-    println!("Zero-cost time to be: {} ms", bound/size*100);
+    println!("Zero-cost time to be: {} ms", bound / size * 100);
 }

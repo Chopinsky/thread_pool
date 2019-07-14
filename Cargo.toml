@@ -13,3 +13,10 @@ edition = "2018"
 crossbeam-channel = "^0.3.0"
 hashbrown = "^0.1.8"
 parking_lot = "^0.7.1"
+
+[dev-dependencies]
+criterion = "0.2"
+
+[[bench]]
+name = "thread_pool_bench"
+harness = false

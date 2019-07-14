@@ -1,13 +1,16 @@
-use std::sync::{Arc, atomic::{AtomicU8, Ordering}};
+use std::sync::{
+    atomic::{AtomicU8, Ordering},
+    Arc,
+};
 use std::time::Duration;
 use std::vec;
 
-use crossbeam_channel as channel;
-use crossbeam_channel::{Sender, SendTimeoutError, TrySendError, SendError};
 use crate::config::{Config, ConfigStatus, TimeoutPolicy};
 use crate::debug::is_debug_mode;
-use crate::model::*;
 use crate::manager::*;
+use crate::model::*;
+use channel::{SendError, SendTimeoutError, Sender, TrySendError};
+use crossbeam_channel as channel;
 
 const RETRY_LIMIT: u8 = 4;
 const CHAN_CAP: usize = 16;
@@ -179,7 +182,10 @@ impl ThreadPool {
     /// }
     /// ```
     pub fn activate(&mut self) -> &mut Self {
-        debug_assert!(self.init_size > 0, "The initial pool size must be equal or larger than 1 ...");
+        debug_assert!(
+            self.init_size > 0,
+            "The initial pool size must be equal or larger than 1 ..."
+        );
 
         let status = self.status.load(Ordering::Acquire);
 
@@ -199,7 +205,11 @@ impl ThreadPool {
         let workers_count = self.manager.workers_count();
         if workers_count < self.init_size {
             // lazy init the pool at the first job, or regenerate workers when all are purged
-            self.manager.add_workers(self.init_size - workers_count, true, Arc::clone(&self.status));
+            self.manager.add_workers(
+                self.init_size - workers_count,
+                true,
+                Arc::clone(&self.status),
+            );
         }
 
         // update the status after activation.
@@ -265,9 +275,11 @@ impl ThreadPool {
     ///     }, true);
     /// }
     /// ```
-    pub fn exec<F: FnOnce() + Send + 'static>(&mut self, f: F, prioritized: bool)
-        -> Result<(), ExecutionError>
-    {
+    pub fn exec<F: FnOnce() + Send + 'static>(
+        &mut self,
+        f: F,
+        prioritized: bool,
+    ) -> Result<(), ExecutionError> {
         let status = self.status.load(Ordering::Acquire);
 
         // we're closing the pool, take no more new jobs
@@ -287,11 +299,7 @@ impl ThreadPool {
         }
 
         // if we can auto scale the pool, set the retry stack limit
-        let retry = if self.auto_scale {
-            1
-        } else {
-            0
-        };
+        let retry = if self.auto_scale { 1 } else { 0 };
 
         // send the job for execution
         self.dispatch(Message::NewJob(Box::new(f)), retry, prioritized)
@@ -300,16 +308,16 @@ impl ThreadPool {
                     // auto scale by adding more workers to take the job
                     if let Some(target) = self.resize_target(self.init_size) {
                         self.manager.add_workers(
-                            target - worker_count, false, Arc::clone(&self.status)
+                            target - worker_count,
+                            false,
+                            Arc::clone(&self.status),
                         );
                     }
                 }
             })
-            .map_err(|err| {
-                match err {
-                    SendTimeoutError::Timeout(_) => ExecutionError::Timeout,
-                    SendTimeoutError::Disconnected(_) => ExecutionError::Disconnected,
-                }
+            .map_err(|err| match err {
+                SendTimeoutError::Timeout(_) => ExecutionError::Timeout,
+                SendTimeoutError::Disconnected(_) => ExecutionError::Disconnected,
             })
     }
 
@@ -339,9 +347,7 @@ impl ThreadPool {
     ///     });
     /// }
     /// ```
-    pub fn execute<F: FnOnce() + Send + 'static>(&self, f: F)
-        -> Result<(), ExecutionError>
-    {
+    pub fn execute<F: FnOnce() + Send + 'static>(&self, f: F) -> Result<(), ExecutionError> {
         let status = self.status.load(Ordering::Acquire);
 
         // we're closing, taking no more jobs.
@@ -359,32 +365,34 @@ impl ThreadPool {
         let prioritized = self.chan.1.is_empty() && !self.chan.0.is_full();
         self.dispatch(Message::NewJob(Box::new(f)), 0, prioritized)
             .map(|_| {})
-            .map_err(|err| {
-                match err {
-                    SendTimeoutError::Timeout(_) => ExecutionError::Timeout,
-                    SendTimeoutError::Disconnected(_) => ExecutionError::Disconnected,
-                }
+            .map_err(|err| match err {
+                SendTimeoutError::Timeout(_) => ExecutionError::Timeout,
+                SendTimeoutError::Disconnected(_) => ExecutionError::Disconnected,
             })
     }
 
-    fn dispatch(&self, message: Message, retry: u8, with_priority: bool)
-        -> Result<bool, SendTimeoutError<Message>>
-    {
+    fn dispatch(
+        &self,
+        message: Message,
+        retry: u8,
+        with_priority: bool,
+    ) -> Result<bool, SendTimeoutError<Message>> {
         // pick the work queue where we shall put this new job into
-        let (chan, chan_id) =
-            if with_priority || (self.chan.1.is_empty() && self.chan.0.len() <= self.upgrade_threshold) {
-                // squeeze the work into the priority chan first even if some normal work is in queue
-                (&self.chan.0, 0)
-            } else {
-                // normal work and then priority queue is full
-                (&self.chan.1, 1)
-            };
+        let (chan, chan_id) = if with_priority
+            || (self.chan.1.is_empty() && self.chan.0.len() <= self.upgrade_threshold)
+        {
+            // squeeze the work into the priority chan first even if some normal work is in queue
+            (&self.chan.0, 0)
+        } else {
+            // normal work and then priority queue is full
+            (&self.chan.1, 1)
+        };
 
         let res = match self.queue_timeout {
             Some(period) => {
                 // spin and retry to send the message on timeout
                 self.send_timeout((chan, chan_id), message, period, retry)
-            },
+            }
             None => {
                 if !self.non_blocking {
                     // wait until a worker is ready to take new work
@@ -429,7 +437,9 @@ impl ThreadPool {
             return true;
         }
 
-        self.status.compare_exchange_weak(old, new, Ordering::SeqCst, Ordering::Relaxed).is_ok()
+        self.status
+            .compare_exchange_weak(old, new, Ordering::SeqCst, Ordering::Relaxed)
+            .is_ok()
     }
 
     fn shut_down(&mut self, forced: bool) {
@@ -437,6 +447,10 @@ impl ThreadPool {
             self.set_status(FLAG_CLOSING);
         } else {
             self.set_status(FLAG_FORCE_CLOSE);
+        }
+
+        if is_debug_mode() {
+            println!("Remainder work before shutdown signal: {}", self.chan.0.len() + self.chan.1.len());
         }
 
         self.clear();
@@ -455,20 +469,13 @@ impl ThreadPool {
         let non_blocking = config.non_blocking();
         let policy = config.timeout_policy();
 
-        let flag =
-            Arc::new(AtomicU8::new(
-                if !lazy_built { FLAG_NORMAL } else {FLAG_LAZY_INIT }
-            ));
+        let flag = Arc::new(AtomicU8::new(if !lazy_built {
+            FLAG_NORMAL
+        } else {
+            FLAG_LAZY_INIT
+        }));
 
-        let manager =
-            Manager::build(
-                config,
-                pool_size,
-                Arc::clone(&flag),
-                pri_rx,
-                rx,
-                lazy_built,
-            );
+        let manager = Manager::build(config, pool_size, Arc::clone(&flag), pri_rx, rx, lazy_built);
 
         ThreadPool {
             manager,
@@ -580,6 +587,9 @@ pub trait PoolManager {
 }
 
 impl PoolManager for ThreadPool {
+    /// Manually extend the size of the pool. If another operation that's already adding more threads
+    /// to the pool, e.g. the pool is under pressure and trigger a pool extension automatically, then
+    /// this operation will be cancelled.
     fn extend(&mut self, more: usize) {
         if more == 0 {
             return;
@@ -589,6 +599,8 @@ impl PoolManager for ThreadPool {
         self.manager.extend_by(more, Arc::clone(&self.status));
     }
 
+    /// Manually shrink the size of the pool and release system resources. If another operation that's
+    /// reducing the size of the pool is undergoing, this shrink-op will be cancelled.
     fn shrink(&mut self, less: usize) {
         if less == 0 {
             return;
@@ -601,6 +613,9 @@ impl PoolManager for ThreadPool {
         }
     }
 
+    /// Resize the pool to the desired size. This will either trigger a pool extension or contraction.
+    /// Note that if another pool-size changing operation is undergoing, the effect may be cancelled
+    /// out if we're moving towards the same direction (adding pool size, or reducing pool size).
     fn resize(&mut self, total: usize) {
         if total == 0 {
             return;
@@ -616,6 +631,10 @@ impl PoolManager for ThreadPool {
         }
     }
 
+    /// Automatically adjust the pool size according to criteria: if the pool is idling and we've
+    /// previously added temporary workers, we will tell them to cease work before designated expiration
+    /// time; if the pool is overwhelmed and need more workers to handle jobs, we will add more threads
+    /// to the pool.
     fn auto_adjust(&mut self) {
         if let Some(change) = self.resize_target(self.get_queue_length()) {
             self.resize(change);
@@ -633,13 +652,20 @@ impl PoolManager for ThreadPool {
         self.manager.worker_auto_expire(actual_life);
     }
 
+    /// Remove a thread worker from the pool with the given worker id.
     fn kill_worker(&mut self, id: usize) {
         if self.manager.dismiss_worker(id).is_none() {
             // can't find the worker with the given id, quit now.
             return;
         }
 
-        if self.chan.0.send(Message::Terminate(vec::from_elem(id, 1))).is_err() && is_debug_mode() {
+        if self
+            .chan
+            .0
+            .send(Message::Terminate(vec::from_elem(id, 1)))
+            .is_err()
+            && is_debug_mode()
+        {
             eprintln!("Failed to send the termination message to worker: {}", id);
         }
 
@@ -648,14 +674,22 @@ impl PoolManager for ThreadPool {
         }
     }
 
+    /// Clear the pool. Note this will not kill all workers immediately, and the API will block until
+    /// all workers have finished their current job. Note that this also means we may leave queued jobs
+    /// in place until new threads are added into the pool, otherwise, the jobs will not be executed
+    /// and go away on program exit.
     fn clear(&mut self) {
         self.manager.remove_all(true);
     }
 
+    /// Signal the threads in the pool that we're closing, but allow them to finish all jobs in the queue
+    /// before exiting.
     fn close(&mut self) {
         self.shut_down(false);
     }
 
+    /// Signal the threads that they must quit now, and all queued jobs in the queue will be de-factor
+    /// discarded since we're closing the pool.
     fn force_close(&mut self) {
         self.shut_down(true);
     }
@@ -730,29 +764,42 @@ impl PoolState for ThreadPool {
 }
 
 trait DispatchFlavors {
-    fn send_timeout(&self, chan: (&Sender<Message>, u8), message: Message, timeout: Duration, retry: u8)
-        -> Result<(), SendTimeoutError<Message>>;
-    fn send(&self, chan: &Sender<Message>, message: Message)
-        -> Result<(), SendTimeoutError<Message>>;
-    fn try_send(&self, chan: (&Sender<Message>, u8), message: Message)
-        -> Result<(), SendTimeoutError<Message>>;
+    fn send_timeout(
+        &self,
+        chan: (&Sender<Message>, u8),
+        message: Message,
+        timeout: Duration,
+        retry: u8,
+    ) -> Result<(), SendTimeoutError<Message>>;
+    fn send(
+        &self,
+        chan: &Sender<Message>,
+        message: Message,
+    ) -> Result<(), SendTimeoutError<Message>>;
+    fn try_send(
+        &self,
+        chan: (&Sender<Message>, u8),
+        message: Message,
+    ) -> Result<(), SendTimeoutError<Message>>;
 }
 
 impl DispatchFlavors for ThreadPool {
-    fn send_timeout(&self, chan: (&Sender<Message>, u8), message: Message, timeout: Duration, retry: u8)
-        -> Result<(), SendTimeoutError<Message>>
-    {
+    fn send_timeout(
+        &self,
+        chan: (&Sender<Message>, u8),
+        message: Message,
+        timeout: Duration,
+        retry: u8,
+    ) -> Result<(), SendTimeoutError<Message>> {
         let mut retry_message = message;
         let mut retry = retry;
 
         loop {
             match chan.0.send_timeout(retry_message, timeout) {
-                Ok(()) => {
-                    return Ok(())
-                },
+                Ok(()) => return Ok(()),
                 Err(SendTimeoutError::Disconnected(msg)) => {
                     return Err(SendTimeoutError::Disconnected(msg))
-                },
+                }
                 Err(SendTimeoutError::Timeout(msg)) => {
                     retry_message = msg;
 
@@ -766,7 +813,7 @@ impl DispatchFlavors for ThreadPool {
                             // done at the moment. Balancing or releasing resources can happen
                             // later.
                             self.manager.drop_many(chan.1, retry as usize);
-                        },
+                        }
                         TimeoutPolicy::DirectRun => {
                             // directly run the job; the termination message will not be
                             // sent in this workflow, so we shall not worry about that.
@@ -776,7 +823,7 @@ impl DispatchFlavors for ThreadPool {
 
                             // done with it
                             return Ok(());
-                        },
+                        }
                         TimeoutPolicy::Drop => {
                             // done with the retry (or not allowed), return and drop the job
                             if retry == 0 || retry > RETRY_LIMIT {
@@ -787,23 +834,27 @@ impl DispatchFlavors for ThreadPool {
 
                     // if we shall try again, update the counter
                     retry += 1;
-                },
+                }
             }
         }
     }
 
-    fn send(&self, chan: &Sender<Message>, message: Message)
-        -> Result<(), SendTimeoutError<Message>>
-    {
+    fn send(
+        &self,
+        chan: &Sender<Message>,
+        message: Message,
+    ) -> Result<(), SendTimeoutError<Message>> {
         match chan.send(message) {
             Ok(()) => Ok(()),
             Err(SendError(msg)) => Err(SendTimeoutError::Disconnected(msg)),
         }
     }
 
-    fn try_send(&self, chan: (&Sender<Message>, u8), message: Message)
-        -> Result<(), SendTimeoutError<Message>>
-    {
+    fn try_send(
+        &self,
+        chan: (&Sender<Message>, u8),
+        message: Message,
+    ) -> Result<(), SendTimeoutError<Message>> {
         // timeout immediately if all workers are busy
         match chan.0.try_send(message) {
             Ok(()) => Ok(()),
@@ -814,14 +865,10 @@ impl DispatchFlavors for ThreadPool {
                     self.manager.drop_one(chan.1);
 
                     // send the message again and hopefully no one else take the space
-                    chan.0
-                        .try_send(msg)
-                        .map_err(|err| {
-                            match err {
-                                TrySendError::Disconnected(msg) => SendTimeoutError::Disconnected(msg),
-                                TrySendError::Full(msg) => SendTimeoutError::Timeout(msg),
-                            }
-                        })
+                    chan.0.try_send(msg).map_err(|err| match err {
+                        TrySendError::Disconnected(msg) => SendTimeoutError::Disconnected(msg),
+                        TrySendError::Full(msg) => SendTimeoutError::Timeout(msg),
+                    })
                 } else {
                     // unable to send the job
                     Err(SendTimeoutError::Timeout(msg))
@@ -834,7 +881,9 @@ impl DispatchFlavors for ThreadPool {
 impl Drop for ThreadPool {
     fn drop(&mut self) {
         if is_debug_mode() {
-            println!("Shutting down this individual pool, sending terminate message to all workers.");
+            println!(
+                "Shutting down this individual pool, sending terminate message to all workers."
+            );
         }
 
         self.close();

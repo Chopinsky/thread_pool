@@ -1,5 +1,6 @@
 use std::time::Duration;
-use crate::manager::{StatusBehaviors, StatusBehaviorSetter};
+
+use crate::manager::{StatusBehaviorSetter, StatusBehaviors};
 use crate::model::WorkerUpdate;
 
 #[derive(Copy, Clone)]

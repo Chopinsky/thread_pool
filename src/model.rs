@@ -44,9 +44,7 @@ pub(crate) fn spin_update(state: &AtomicI8, new: i8) {
     let mut retry = 0;
 
     // wait till the mutating state is restored to state 0
-    while state.compare_exchange_weak(
-        0, new, Ordering::SeqCst, Ordering::Relaxed
-    ) != Ok(0) {
+    while state.compare_exchange_weak(0, new, Ordering::SeqCst, Ordering::Relaxed) != Ok(0) {
         if retry < BACKOFF_RETRY_LIMIT {
             retry += 1;
             cpu_relax(retry);
@@ -83,4 +81,3 @@ pub(crate) fn cpu_relax(count: usize) {
         atomic::spin_loop_hint()
     }
 }
-

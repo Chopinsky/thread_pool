@@ -4,12 +4,13 @@ use std::sync::atomic::{AtomicBool, AtomicI8, Ordering};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
-use hashbrown::{HashMap, HashSet};
-use parking_lot::{Once, OnceState, ONCE_INIT};
+
 use crate::config::{Config, ConfigStatus};
 use crate::debug::is_debug_mode;
-use crate::model::{Backoff, spin_update, concede_update, reset_lock};
-use crate::scheduler::{PoolManager, PoolState, ThreadPool};
+use crate::model::{concede_update, reset_lock, spin_update, Backoff};
+use crate::scheduler::{ThreadPool, PoolManager, PoolState};
+use hashbrown::{HashMap, HashSet};
+use parking_lot::{Once, OnceState, ONCE_INIT};
 
 static ONCE: Once = ONCE_INIT;
 static CLOSING: AtomicBool = AtomicBool::new(false);
@@ -36,9 +37,9 @@ impl PoolStore {
     }
 
     fn take() -> Option<&'static mut PoolStore> {
-        if CLOSING.compare_exchange_weak(
-            false, true, Ordering::SeqCst, Ordering::Relaxed
-        ) == Ok(false) {
+        if CLOSING.compare_exchange_weak(false, true, Ordering::SeqCst, Ordering::Relaxed)
+            == Ok(false)
+        {
             unsafe { MULTI_POOL.as_mut() }
         } else {
             None
@@ -71,13 +72,17 @@ impl Backoff for PoolStore {
 
 #[inline]
 pub fn initialize<S>(keys: std::collections::HashMap<String, usize, S>)
-    where S: std::hash::BuildHasher
+where
+    S: std::hash::BuildHasher,
 {
     init_with_config(keys, Config::default());
 }
 
-pub fn initialize_with_auto_adjustment<S>(keys: std::collections::HashMap<String, usize, S>, period: Option<Duration>)
-    where S: std::hash::BuildHasher
+pub fn initialize_with_auto_adjustment<S>(
+    keys: std::collections::HashMap<String, usize, S>,
+    period: Option<Duration>,
+) where
+    S: std::hash::BuildHasher,
 {
     let mut config = Config::default();
     config.set_refresh_period(period);
@@ -85,13 +90,18 @@ pub fn initialize_with_auto_adjustment<S>(keys: std::collections::HashMap<String
 }
 
 pub fn init_with_config<S>(keys: std::collections::HashMap<String, usize, S>, config: Config)
-    where S: std::hash::BuildHasher
+where
+    S: std::hash::BuildHasher,
 {
     if keys.is_empty() {
         return;
     }
 
-    assert_eq!(ONCE.state(), OnceState::New, "The pool has already been initialized...");
+    assert_eq!(
+        ONCE.state(),
+        OnceState::New,
+        "The pool has already been initialized..."
+    );
 
     // copy to more efficient structure
     let mut map = HashMap::with_capacity(keys.len());
@@ -115,7 +125,7 @@ pub fn run_with<F: FnOnce() + Send + 'static>(key: String, f: F) {
             } else if is_debug_mode() {
                 eprintln!("Unable to identify the pool with given key: {}", key);
             }
-        },
+        }
         None => {
             // pool could have closed, just execute the job
             thread::spawn(f);
@@ -123,7 +133,7 @@ pub fn run_with<F: FnOnce() + Send + 'static>(key: String, f: F) {
             if is_debug_mode() {
                 eprintln!("The pool has been poisoned... The thread pool should be restarted...");
             }
-        },
+        }
     };
 }
 
@@ -195,7 +205,8 @@ pub fn add_pool(key: String, size: usize) -> Option<JoinHandle<()>> {
 }
 
 fn create<S>(keys: HashMap<String, usize, S>, config: Config)
-    where S: std::hash::BuildHasher
+where
+    S: std::hash::BuildHasher,
 {
     let size = keys.len();
     let mut store = HashMap::with_capacity(size);
@@ -205,7 +216,9 @@ fn create<S>(keys: HashMap<String, usize, S>, config: Config)
             continue;
         }
 
-        store.entry(key).or_insert_with(|| ThreadPool::new_with_config(size, config.clone()));
+        store
+            .entry(key)
+            .or_insert_with(|| ThreadPool::new_with_config(size, config.clone()));
     }
 
     unsafe {
@@ -334,20 +347,20 @@ fn trigger_auto_adjustment() {
 
 fn shut_down(forced: bool) {
     match ONCE.state() {
-        OnceState::InProgress => panic!("The pool can't be closed while it's still being initializing..."),
+        OnceState::InProgress => {
+            panic!("The pool can't be closed while it's still being initializing...")
+        }
         OnceState::Done => {
             if let Some(pool_inner) = PoolStore::take() {
-                pool_inner.store
-                    .values_mut()
-                    .for_each(|pool| {
-                        if !forced {
-                            pool.close();
-                        } else {
-                            pool.force_close();
-                        }
-                    });
+                pool_inner.store.values_mut().for_each(|pool| {
+                    if !forced {
+                        pool.close();
+                    } else {
+                        pool.force_close();
+                    }
+                });
             }
-        },
+        }
         _ => return,
     }
 }

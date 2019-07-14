@@ -1,19 +1,26 @@
 #![allow(dead_code)]
 
-use std::sync::{atomic::{AtomicUsize, AtomicI8, AtomicU8, Ordering}, Arc};
+use std::sync::{
+    atomic::{AtomicI8, AtomicU8, AtomicUsize, Ordering},
+    Arc,
+};
+
+use crate::config::{Config, ConfigStatus};
+use crate::debug::is_debug_mode;
+use crate::model::{
+    concede_update, reset_lock, spin_update, Backoff, Message, WorkerUpdate, EXPIRE_PERIOD,
+};
+use crate::worker::Worker;
 use crossbeam_channel::Receiver;
 use hashbrown::HashSet;
 use parking_lot::RwLock;
-use crate::config::{Config, ConfigStatus};
-use crate::debug::is_debug_mode;
-use crate::model::{EXPIRE_PERIOD, Backoff, Message, WorkerUpdate, spin_update, concede_update, reset_lock};
-use crate::worker::Worker;
 
 /// The first id that can be taken by workers. All previous ones are reserved for future use in the
 /// graveyard. Note that the `INIT_ID` is still the one reserved, and manager's first valid
 /// `last_worker_id` shall be greater than this id number.
 const INIT_ID: usize = 15;
 
+#[doc(hidden)]
 pub(crate) struct Manager {
     config: Config,
     workers: Vec<Worker>,
@@ -32,8 +39,7 @@ impl Manager {
         pri_rx: Receiver<Message>,
         rx: Receiver<Message>,
         lazy_built: bool,
-    ) -> Manager
-    {
+    ) -> Manager {
         let mut m = Manager {
             config,
             workers: Vec::new(),
@@ -127,21 +133,19 @@ impl Manager {
                 None => None,
             };
 
-            self.workers.push(
-                Worker::new(
-                    worker_name,
-                    id,
-                    stack_size,
-                    privileged,
-                    (pri_rx, rx),
-                    (
-                        Arc::clone(&self.graveyard),
-                        Arc::clone(&self.max_idle),
-                        Arc::clone(&status)
-                    ),
-                    self.config.worker_behavior()
-                )
-            );
+            self.workers.push(Worker::new(
+                worker_name,
+                id,
+                stack_size,
+                privileged,
+                (pri_rx, rx),
+                (
+                    Arc::clone(&self.graveyard),
+                    Arc::clone(&self.max_idle),
+                    Arc::clone(&status),
+                ),
+                self.config.worker_behavior(),
+            ));
         });
 
         self.reset_lock();
@@ -155,11 +159,7 @@ impl Manager {
         }
 
         // call everyone to wake up and work
-        self.workers
-            .iter()
-            .for_each(|worker| {
-                worker.wake_up();
-            });
+        self.workers.iter().for_each(|worker| worker.wake_up());
     }
 
     fn graveyard_cleanup(&mut self) {
@@ -197,11 +197,12 @@ impl Manager {
     }
 }
 
+#[doc(hidden)]
 pub(crate) trait WorkerManagement {
     fn workers_count(&self) -> usize;
     fn worker_auto_expire(&mut self, life_in_millis: usize);
     fn extend_by(&mut self, more: usize, status: Arc<AtomicU8>);
-    fn shrink_by(&mut self, less:usize) -> Vec<usize>;
+    fn shrink_by(&mut self, less: usize) -> Vec<usize>;
     fn dismiss_worker(&mut self, id: usize) -> Option<usize>;
     fn first_worker_id(&self) -> usize;
     fn last_worker_id(&self) -> usize;
@@ -234,11 +235,12 @@ impl WorkerManagement for Manager {
             return Vec::new();
         }
 
-        let workers = self.workers
+        let workers = self
+            .workers
             .drain(start..)
             .map(|w| {
-                w.wake_up();
                 let id = w.get_id();
+                w.wake_up();
                 g.insert(id);
                 id
             })
@@ -276,14 +278,14 @@ impl WorkerManagement for Manager {
     fn first_worker_id(&self) -> usize {
         match self.workers.first() {
             Some(worker) => worker.get_id(),
-            None => 0
+            None => 0,
         }
     }
 
     fn last_worker_id(&self) -> usize {
         match self.workers.last() {
             Some(worker) => worker.get_id(),
-            None => 0
+            None => 0,
         }
     }
 
@@ -304,6 +306,7 @@ impl WorkerManagement for Manager {
     }
 }
 
+#[doc(hidden)]
 pub(crate) trait JobManagement {
     fn drop_one(&self, from: u8) -> usize;
     fn drop_many(&self, from: u8, target: usize) -> usize;

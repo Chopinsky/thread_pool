@@ -1,14 +1,15 @@
 #![allow(dead_code)]
 
-//use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
-use parking_lot::{Once, OnceState, ONCE_INIT};
+//use std::mem::MaybeUninit;
+
 use crate::config::{Config, ConfigStatus};
 use crate::debug::is_debug_mode;
 use crate::scheduler::{PoolManager, ThreadPool};
+use parking_lot::{Once, OnceState, ONCE_INIT};
 
 static ONCE: Once = ONCE_INIT;
 static CLOSING: AtomicBool = AtomicBool::new(false);
@@ -32,9 +33,9 @@ impl Pool {
     }
 
     fn take() -> Option<&'static mut Pool> {
-        if CLOSING.compare_exchange_weak(
-            false, true, Ordering::SeqCst, Ordering::Relaxed
-        ) == Ok(false) {
+        if CLOSING.compare_exchange_weak(false, true, Ordering::SeqCst, Ordering::Relaxed)
+            == Ok(false)
+        {
             unsafe { POOL.as_mut() }
         } else {
             None
@@ -83,7 +84,11 @@ pub fn initialize_with_auto_adjustment(size: usize, period: Option<Duration>) {
 }
 
 pub fn init_with_config(size: usize, config: Config) {
-    assert_eq!(ONCE.state(), OnceState::New, "The pool has already been initialized...");
+    assert_eq!(
+        ONCE.state(),
+        OnceState::New,
+        "The pool has already been initialized..."
+    );
 
     let pool_size = match size {
         0 => 1,
@@ -101,7 +106,7 @@ pub fn run<F: FnOnce() + Send + 'static>(f: F) {
             if pool.store.exec(f, false).is_err() && is_debug_mode() {
                 eprintln!("The execution of this job has failed...");
             }
-        },
+        }
         None => {
             // This could happen after the pool is closed, just execute the job
             thread::spawn(f);
@@ -109,7 +114,7 @@ pub fn run<F: FnOnce() + Send + 'static>(f: F) {
             if is_debug_mode() {
                 eprintln!("The pool has been poisoned... The thread pool should be restarted...");
             }
-        },
+        }
     };
 }
 
@@ -204,12 +209,11 @@ fn create(size: usize, config: Config) {
         return;
     }
 
-    let (auto_mode, handler) =
-        if let Some(period) = config.refresh_period() {
-            (true, Some(start_auto_adjustment(period)))
-        } else {
-            (false, None)
-        };
+    let (auto_mode, handler) = if let Some(period) = config.refresh_period() {
+        (true, Some(start_auto_adjustment(period)))
+    } else {
+        (false, None)
+    };
 
     // Make the pool
     let mut store = ThreadPool::new_with_config(size, config.clone());
@@ -223,17 +227,21 @@ fn create(size: usize, config: Config) {
             auto_adjust_handler: handler,
         });
 
-//        S_POOL.as_mut_ptr().write(Pool {
-//            store,
-//            auto_mode,
-//            auto_adjust_handler: handler,
-//        });
+        /*
+                S_POOL.as_mut_ptr().write(Pool {
+                    store,
+                    auto_mode,
+                    auto_adjust_handler: handler,
+                });
+        */
     }
 }
 
 fn shut_down(forced: bool) {
     match ONCE.state() {
-        OnceState::InProgress => panic!("The pool can't be closed while it's still being initializing..."),
+        OnceState::InProgress => {
+            panic!("The pool can't be closed while it's still being initializing...")
+        }
         OnceState::Done => {
             if let Some(pool_inner) = Pool::take() {
                 if !forced {
@@ -242,7 +250,7 @@ fn shut_down(forced: bool) {
                     pool_inner.store.force_close();
                 }
             }
-        },
+        }
         _ => return,
     }
 }
