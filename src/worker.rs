@@ -1,14 +1,11 @@
 #![allow(dead_code)]
 
-use std::sync::{
-    atomic::{AtomicU8, AtomicUsize, Ordering},
-    Arc,
-};
+use std::sync::{atomic::{AtomicU8, Ordering}, Arc};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
 use crate::debug::is_debug_mode;
-use crate::manager::{StatusBehaviorDefinitions, StatusBehaviors};
+use crate::manager::{StatusBehaviorDefinitions, StatusBehaviors, MaxIdle};
 use crate::model::*;
 use crossbeam_channel as channel;
 use hashbrown::HashSet;
@@ -37,7 +34,7 @@ impl Worker {
         stack_size: usize,
         privileged: bool,
         rx_pair: (channel::Receiver<Message>, channel::Receiver<Message>),
-        shared_info: (Arc<RwLock<HashSet<usize>>>, Arc<AtomicUsize>, Arc<AtomicU8>), // (graveyard, max_idle, pool_status)
+        shared_info: (Arc<RwLock<HashSet<usize>>>, Arc<AtomicU8>, MaxIdle), // (graveyard, max_idle, pool_status)
         behavior_definition: &StatusBehaviors,
     ) -> Worker {
         behavior_definition.before_start(my_id);
@@ -88,7 +85,7 @@ impl Worker {
         stack_size: usize,
         privileged: bool,
         rx_pair: (channel::Receiver<Message>, channel::Receiver<Message>),
-        shared_info: (Arc<RwLock<HashSet<usize>>>, Arc<AtomicUsize>, Arc<AtomicU8>),
+        shared_info: (Arc<RwLock<HashSet<usize>>>, Arc<AtomicU8>, MaxIdle),
     ) -> thread::JoinHandle<()> {
         let mut builder = thread::Builder::new();
 
@@ -112,7 +109,7 @@ impl Worker {
             };
 
             // unpack the shared info triple
-            let (graveyard, max_idle, pool_status) = shared_info;
+            let (graveyard, pool_status, max_idle) = shared_info;
 
             // main worker loop
             loop {
@@ -159,8 +156,7 @@ impl Worker {
                     .and_then(|idle| {
                         // if idled longer than the expected worker life for unprivileged workers,
                         // then we're done now -- self-purging.
-                        let max = max_idle.load(Ordering::Relaxed) as u128;
-                        if max.gt(&0) && max.le(&idle.as_millis()) {
+                        if max_idle.expired(&idle.as_millis()) {
                             // mark self as a voluntary retiree
                             graveyard.write().insert(my_id);
                             return Some(());
