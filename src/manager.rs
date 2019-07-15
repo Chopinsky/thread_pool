@@ -1,9 +1,6 @@
 #![allow(dead_code)]
 
-use std::sync::{
-    atomic::{AtomicI8, AtomicU8, AtomicUsize, Ordering},
-    Arc,
-};
+use std::sync::{atomic::{AtomicI8, AtomicU8}, Arc};
 
 use crate::config::{Config, ConfigStatus};
 use crate::debug::is_debug_mode;
@@ -26,8 +23,8 @@ pub(crate) struct Manager {
     workers: Vec<Worker>,
     mutating: AtomicI8,
     last_worker_id: usize,
+    max_idle: usize,
     graveyard: Arc<RwLock<HashSet<usize>>>,
-    max_idle: Arc<AtomicUsize>,
     chan: (Receiver<Message>, Receiver<Message>),
 }
 
@@ -45,8 +42,8 @@ impl Manager {
             workers: Vec::new(),
             mutating: AtomicI8::new(0),
             last_worker_id: INIT_ID,
+            max_idle: EXPIRE_PERIOD,
             graveyard: Arc::new(RwLock::new(HashSet::new())),
-            max_idle: Arc::new(AtomicUsize::new(EXPIRE_PERIOD)),
             chan: (pri_rx, rx),
         };
 
@@ -127,6 +124,7 @@ impl Manager {
             // workers queue
             let id = self.last_worker_id + offset;
             let (rx, pri_rx) = (self.chan.0.clone(), self.chan.1.clone());
+            let idle = MaxIdle(&self.max_idle as *const usize);
 
             let worker_name = match base_name.as_ref() {
                 Some(name) => Some(format!("{}-{}", name, id)),
@@ -141,8 +139,8 @@ impl Manager {
                 (pri_rx, rx),
                 (
                     Arc::clone(&self.graveyard),
-                    Arc::clone(&self.max_idle),
                     Arc::clone(&status),
+                    idle.clone(),
                 ),
                 self.config.worker_behavior(),
             ));
@@ -215,7 +213,7 @@ impl WorkerManagement for Manager {
     }
 
     fn worker_auto_expire(&mut self, life_in_millis: usize) {
-        self.max_idle.swap(life_in_millis, Ordering::SeqCst);
+        self.max_idle = life_in_millis;
     }
 
     fn extend_by(&mut self, more: usize, status: Arc<AtomicU8>) {
@@ -468,3 +466,22 @@ impl Default for StatusBehaviors {
         Self::new()
     }
 }
+
+// Wrapper
+pub(crate) struct MaxIdle(*const usize);
+
+impl MaxIdle {
+    pub(crate) fn expired(&self, period: &u128) -> bool {
+        let max = unsafe { *self.0 as u128 };
+        max.gt(&0) && max.le(period)
+    }
+}
+
+impl Clone for MaxIdle {
+    fn clone(&self) -> Self {
+        MaxIdle(self.0)
+    }
+}
+
+unsafe impl Send for MaxIdle {}
+unsafe impl Sync for MaxIdle {}
