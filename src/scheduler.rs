@@ -1,7 +1,5 @@
-use std::sync::{
-    atomic::{AtomicU8, Ordering},
-    Arc,
-};
+use std::ptr;
+use std::sync::atomic::{self, AtomicU8, Ordering};
 use std::time::Duration;
 use std::vec;
 
@@ -11,6 +9,7 @@ use crate::manager::*;
 use crate::model::*;
 use channel::{SendError, SendTimeoutError, Sender, TrySendError};
 use crossbeam_channel as channel;
+use std::ptr::NonNull;
 
 const RETRY_LIMIT: u8 = 4;
 const CHAN_CAP: usize = 16;
@@ -92,7 +91,7 @@ pub struct ThreadPool {
     /// Determine the pool status: 1) Closing -- this will serve as the gate keeper for rejecting any
     /// jobs _after_ a pool shutting down is scheduled; 2) Hibernating -- this will serve as a gate
     /// keeper from accepting any new jobs if the pool is hibernating.
-    status: Arc<AtomicU8>,
+    status: PoolStatus,
 
     /// If we allow the pool to scale itself without explicitly API calls. If this option is turned
     /// on, we will automatically add more workers to the reservoir when the pool is under pressure
@@ -187,7 +186,7 @@ impl ThreadPool {
             "The initial pool size must be equal or larger than 1 ..."
         );
 
-        let status = self.status.load(Ordering::Acquire);
+        let status = self.status.load();
 
         // No need or can't activate ...
         if status != FLAG_HIBERNATING || status != FLAG_LAZY_INIT {
@@ -208,7 +207,7 @@ impl ThreadPool {
             self.manager.add_workers(
                 self.init_size - workers_count,
                 true,
-                Arc::clone(&self.status),
+                self.status.clone(),
             );
         }
 
@@ -280,7 +279,7 @@ impl ThreadPool {
         f: F,
         prioritized: bool,
     ) -> Result<(), ExecutionError> {
-        let status = self.status.load(Ordering::Acquire);
+        let status = self.status.load();
 
         // we're closing the pool, take no more new jobs
         if status == FLAG_CLOSING || status == FLAG_FORCE_CLOSE {
@@ -310,7 +309,7 @@ impl ThreadPool {
                         self.manager.add_workers(
                             target - worker_count,
                             false,
-                            Arc::clone(&self.status),
+                            self.status.clone(),
                         );
                     }
                 }
@@ -348,7 +347,7 @@ impl ThreadPool {
     /// }
     /// ```
     pub fn execute<F: FnOnce() + Send + 'static>(&self, f: F) -> Result<(), ExecutionError> {
-        let status = self.status.load(Ordering::Acquire);
+        let status = self.status.load();
 
         // we're closing, taking no more jobs.
         if status == FLAG_CLOSING || status == FLAG_FORCE_CLOSE {
@@ -429,7 +428,7 @@ impl ThreadPool {
     }
 
     fn set_status(&mut self, status: u8) {
-        self.status.store(status, Ordering::SeqCst);
+        self.status.store(status);
     }
 
     fn update_status(&mut self, old: u8, new: u8) -> bool {
@@ -437,9 +436,7 @@ impl ThreadPool {
             return true;
         }
 
-        self.status
-            .compare_exchange_weak(old, new, Ordering::SeqCst, Ordering::Relaxed)
-            .is_ok()
+        self.status.compare_exchange(old, new)
     }
 
     fn shut_down(&mut self, forced: bool) {
@@ -469,13 +466,17 @@ impl ThreadPool {
         let non_blocking = config.non_blocking();
         let policy = config.timeout_policy();
 
-        let flag = Arc::new(AtomicU8::new(if !lazy_built {
-            FLAG_NORMAL
-        } else {
-            FLAG_LAZY_INIT
-        }));
+        let flag = PoolStatus::new(
+            if !lazy_built {
+                FLAG_NORMAL
+            } else {
+                FLAG_LAZY_INIT
+            }
+        );
 
-        let manager = Manager::build(config, pool_size, Arc::clone(&flag), pri_rx, rx, lazy_built);
+        let manager = Manager::build(
+            config, pool_size, flag.clone(), pri_rx, rx, lazy_built
+        );
 
         ThreadPool {
             manager,
@@ -530,7 +531,7 @@ impl Hibernation for ThreadPool {
 
     /// Check if the pool is in hibernation mode.
     fn is_hibernating(&self) -> bool {
-        self.status.load(Ordering::Acquire) == FLAG_HIBERNATING
+        self.status.load() == FLAG_HIBERNATING
     }
 }
 
@@ -596,7 +597,7 @@ impl PoolManager for ThreadPool {
         }
 
         // manager will update the graveyard
-        self.manager.extend_by(more, Arc::clone(&self.status));
+        self.manager.extend_by(more, self.status.clone());
     }
 
     /// Manually shrink the size of the pool and release system resources. If another operation that's
@@ -889,3 +890,54 @@ impl Drop for ThreadPool {
         self.close();
     }
 }
+
+// A thinner version of the Arc wrapper over atomic, such that we can save a few atomic op on every
+// new worker creation and status checks on the worker's side.
+#[doc(hidden)]
+pub(crate) struct PoolStatus(NonNull<AtomicU8>);
+
+impl PoolStatus {
+    fn new(val: u8) -> Self {
+        let wrapper = Box::new(AtomicU8::new(val));
+        PoolStatus(unsafe {
+            NonNull::new_unchecked(Box::into_raw(wrapper))
+        })
+    }
+
+    fn compare_exchange(&self, old: u8, new: u8) -> bool {
+        unsafe {
+            self.0
+                .as_ref()
+                .compare_exchange_weak(old, new, Ordering::SeqCst, Ordering::Relaxed)
+                .is_ok()
+        }
+    }
+
+    fn store(&self, new: u8) {
+        unsafe { self.0.as_ref().store(new, Ordering::SeqCst); }
+    }
+
+    #[inline]
+    pub(crate) fn load(&self) -> u8 {
+        unsafe { self.0.as_ref().load(Ordering::Acquire) }
+    }
+}
+
+impl Clone for PoolStatus {
+    fn clone(&self) -> Self {
+        PoolStatus(self.0)
+    }
+}
+
+impl Drop for PoolStatus {
+    fn drop(&mut self) {
+        atomic::fence(Ordering::SeqCst);
+
+        unsafe {
+            ptr::drop_in_place(self.0.as_ptr());
+        }
+    }
+}
+
+unsafe impl Send for PoolStatus {}
+unsafe impl Sync for PoolStatus {}

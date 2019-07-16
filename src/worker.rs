@@ -1,12 +1,13 @@
 #![allow(dead_code)]
 
-use std::sync::{atomic::{AtomicU8, Ordering}, Arc};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime};
 
 use crate::debug::is_debug_mode;
 use crate::manager::{StatusBehaviorDefinitions, StatusBehaviors, MaxIdle};
 use crate::model::*;
+use crate::scheduler::PoolStatus;
 use crossbeam_channel as channel;
 use hashbrown::HashSet;
 use parking_lot::RwLock;
@@ -34,7 +35,7 @@ impl Worker {
         stack_size: usize,
         privileged: bool,
         rx_pair: (channel::Receiver<Message>, channel::Receiver<Message>),
-        shared_info: (Arc<RwLock<HashSet<usize>>>, Arc<AtomicU8>, MaxIdle), // (graveyard, max_idle, pool_status)
+        shared_info: (Arc<RwLock<HashSet<usize>>>, PoolStatus, MaxIdle), // (graveyard, max_idle, pool_status)
         behavior_definition: &StatusBehaviors,
     ) -> Worker {
         behavior_definition.before_start(my_id);
@@ -85,7 +86,7 @@ impl Worker {
         stack_size: usize,
         privileged: bool,
         rx_pair: (channel::Receiver<Message>, channel::Receiver<Message>),
-        shared_info: (Arc<RwLock<HashSet<usize>>>, Arc<AtomicU8>, MaxIdle),
+        shared_info: (Arc<RwLock<HashSet<usize>>>, PoolStatus, MaxIdle),
     ) -> thread::JoinHandle<()> {
         let mut builder = thread::Builder::new();
 
@@ -122,7 +123,7 @@ impl Worker {
                 }
 
                 // get the pool status code
-                status = pool_status.load(Ordering::Acquire);
+                status = pool_status.load();
                 if status == FLAG_FORCE_CLOSE
                     || (status == FLAG_CLOSING && rx_pair.0.is_empty() && rx_pair.1.is_empty())
                 {

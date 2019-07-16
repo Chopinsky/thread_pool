@@ -1,12 +1,13 @@
 #![allow(dead_code)]
-
-use std::sync::{atomic::{AtomicI8, AtomicU8}, Arc};
+use std::ptr::NonNull;
+use std::sync::{atomic::AtomicI8, Arc};
 
 use crate::config::{Config, ConfigStatus};
 use crate::debug::is_debug_mode;
 use crate::model::{
     concede_update, reset_lock, spin_update, Backoff, Message, WorkerUpdate, EXPIRE_PERIOD,
 };
+use crate::scheduler::PoolStatus;
 use crate::worker::Worker;
 use crossbeam_channel::Receiver;
 use hashbrown::HashSet;
@@ -23,7 +24,7 @@ pub(crate) struct Manager {
     workers: Vec<Worker>,
     mutating: AtomicI8,
     last_worker_id: usize,
-    max_idle: usize,
+    max_idle: MaxIdle,
     graveyard: Arc<RwLock<HashSet<usize>>>,
     chan: (Receiver<Message>, Receiver<Message>),
 }
@@ -32,17 +33,22 @@ impl Manager {
     pub(crate) fn build(
         config: Config,
         range: usize,
-        status: Arc<AtomicU8>,
+        status: PoolStatus,
         pri_rx: Receiver<Message>,
         rx: Receiver<Message>,
         lazy_built: bool,
     ) -> Manager {
+        let idle = Box::new(EXPIRE_PERIOD);
+        let max_idle = MaxIdle(unsafe {
+            NonNull::new_unchecked(Box::into_raw(idle))
+        });
+
         let mut m = Manager {
             config,
             workers: Vec::new(),
             mutating: AtomicI8::new(0),
             last_worker_id: INIT_ID,
-            max_idle: EXPIRE_PERIOD,
+            max_idle,
             graveyard: Arc::new(RwLock::new(HashSet::new())),
             chan: (pri_rx, rx),
         };
@@ -97,7 +103,7 @@ impl Manager {
         self.last_worker_id = INIT_ID;
     }
 
-    pub(crate) fn add_workers(&mut self, count: usize, privileged: bool, status: Arc<AtomicU8>) {
+    pub(crate) fn add_workers(&mut self, count: usize, privileged: bool, status: PoolStatus) {
         if count == 0 {
             return;
         }
@@ -124,7 +130,6 @@ impl Manager {
             // workers queue
             let id = self.last_worker_id + offset;
             let (rx, pri_rx) = (self.chan.0.clone(), self.chan.1.clone());
-            let idle = MaxIdle(&self.max_idle as *const usize);
 
             let worker_name = match base_name.as_ref() {
                 Some(name) => Some(format!("{}-{}", name, id)),
@@ -139,8 +144,8 @@ impl Manager {
                 (pri_rx, rx),
                 (
                     Arc::clone(&self.graveyard),
-                    Arc::clone(&status),
-                    idle.clone(),
+                    status.clone(),
+                    self.max_idle.clone(),
                 ),
                 self.config.worker_behavior(),
             ));
@@ -199,7 +204,7 @@ impl Manager {
 pub(crate) trait WorkerManagement {
     fn workers_count(&self) -> usize;
     fn worker_auto_expire(&mut self, life_in_millis: usize);
-    fn extend_by(&mut self, more: usize, status: Arc<AtomicU8>);
+    fn extend_by(&mut self, more: usize, status: PoolStatus);
     fn shrink_by(&mut self, less: usize) -> Vec<usize>;
     fn dismiss_worker(&mut self, id: usize) -> Option<usize>;
     fn first_worker_id(&self) -> usize;
@@ -213,10 +218,13 @@ impl WorkerManagement for Manager {
     }
 
     fn worker_auto_expire(&mut self, life_in_millis: usize) {
-        self.max_idle = life_in_millis;
+        unsafe {
+            let inner = self.max_idle.0.as_mut();
+            *inner = life_in_millis;
+        }
     }
 
-    fn extend_by(&mut self, more: usize, status: Arc<AtomicU8>) {
+    fn extend_by(&mut self, more: usize, status: PoolStatus) {
         self.add_workers(more, true, status);
     }
 
@@ -468,11 +476,11 @@ impl Default for StatusBehaviors {
 }
 
 // Wrapper
-pub(crate) struct MaxIdle(*const usize);
+pub(crate) struct MaxIdle(NonNull<usize>);
 
 impl MaxIdle {
     pub(crate) fn expired(&self, period: &u128) -> bool {
-        let max = unsafe { *self.0 as u128 };
+        let max = unsafe { *self.0.as_ref() as u128 };
         max.gt(&0) && max.le(period)
     }
 }
@@ -480,6 +488,12 @@ impl MaxIdle {
 impl Clone for MaxIdle {
     fn clone(&self) -> Self {
         MaxIdle(self.0)
+    }
+}
+
+impl Drop for MaxIdle {
+    fn drop(&mut self) {
+        unsafe { std::ptr::drop_in_place(self.0.as_ptr()); }
     }
 }
 
