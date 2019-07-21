@@ -7,6 +7,7 @@ pub(crate) const FLAG_CLOSING: u8 = 1;
 pub(crate) const FLAG_FORCE_CLOSE: u8 = 2;
 pub(crate) const FLAG_HIBERNATING: u8 = 4;
 pub(crate) const FLAG_LAZY_INIT: u8 = 8;
+pub(crate) const FLAG_REST: u8 = 16;
 pub(crate) const EXPIRE_PERIOD: usize = 64;
 const BACKOFF_RETRY_LIMIT: usize = 16;
 
@@ -17,7 +18,7 @@ pub(crate) enum Message {
 }
 
 // Base types
-pub(crate) type Job = Box<FnBox + Send + 'static>;
+pub(crate) type Job = Box<dyn FnBox + Send + 'static>;
 pub(crate) type WorkerUpdate = fn(id: usize);
 
 // Traits

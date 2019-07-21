@@ -111,6 +111,11 @@ impl Worker {
 
             // unpack the shared info triple
             let (graveyard, pool_status, max_idle) = shared_info;
+            let (pri_wait, norm_wait) = match my_id % LOT_COUNTS {
+                0 => (true, false),
+                1 => (false, true),
+                _ => (false, false),
+            };
 
             // main worker loop
             loop {
@@ -125,7 +130,7 @@ impl Worker {
                 // get the pool status code
                 status = pool_status.load();
                 if status == FLAG_FORCE_CLOSE
-                    || (status == FLAG_CLOSING && rx_pair.0.is_empty() && rx_pair.1.is_empty())
+                    || ((status == FLAG_CLOSING || status == FLAG_REST) && rx_pair.0.is_empty() && rx_pair.1.is_empty())
                 {
                     // if shutting down, check if we can abandon all work by checking forced
                     // close flag, or when all work have been processed.
@@ -134,9 +139,10 @@ impl Worker {
 
                 // wait for work loop
                 let (work, target) = match Worker::check_queues(
-                    my_id,
                     &rx_pair.0,
                     &rx_pair.1,
+                    pri_wait,
+                    norm_wait,
                     &mut pri_work_count,
                 ) {
                     // if the channels are disconnected, return
@@ -207,9 +213,10 @@ impl Worker {
     }
 
     fn check_queues(
-        id: usize,
         pri_chan: &channel::Receiver<Message>,
         norm_chan: &channel::Receiver<Message>,
+        pri_wait: bool,
+        norm_wait: bool,
         pri_work_count: &mut u8,
     ) -> WorkStatus {
         // wait for work loop, 1/3 of workers will long-park for priority work, and 1/3 of workers
@@ -217,8 +224,9 @@ impl Worker {
         // query both queues -- whichever yield a task, then it will execute that task.
         if *pri_work_count < 255 {
             // 1/3 of the workers is designated to wait longer for prioritised jobs
-            let parking = id % LOT_COUNTS == 0;
-            match Worker::fetch_work(pri_chan, norm_chan.is_empty(), !parking) {
+            let norm_full = norm_chan.is_full();
+
+            match Worker::fetch_work(pri_chan, norm_full && !pri_wait) {
                 Ok(message) => {
                     // message is the only place that can update the "done" field
                     let (job, target) = Worker::unpack_message(message);
@@ -226,7 +234,7 @@ impl Worker {
                     if *pri_work_count < 4 {
                         // only add if we're below the continuous pri-work cap
                         *pri_work_count += 1;
-                    } else if norm_chan.is_full() {
+                    } else if norm_full {
                         // if we've done 4 or more priority work in a row, check if
                         // we should skip if the normal channel is full and maybe
                         // blocking, by setting the special number
@@ -252,7 +260,7 @@ impl Worker {
         }
 
         // 1/3 of the workers is designated to wait longer for normal jobs
-        match Worker::fetch_work(norm_chan, pri_chan.is_empty(), id % LOT_COUNTS == 1) {
+        match Worker::fetch_work(norm_chan, pri_chan.is_full() && !norm_wait) {
             Ok(message) => {
                 // message is the only place that can update the "done" field
                 let (job, target) = Worker::unpack_message(message);
@@ -274,7 +282,6 @@ impl Worker {
 
     fn fetch_work(
         main_chan: &channel::Receiver<Message>,
-        side_chan_empty: bool,
         can_skip: bool,
     ) -> Result<Message, channel::RecvTimeoutError> {
         let mut wait = 0;
@@ -293,7 +300,7 @@ impl Worker {
                     return Err(channel::RecvTimeoutError::Disconnected)
                 }
                 Err(channel::TryRecvError::Empty) => {
-                    if can_skip && !side_chan_empty {
+                    if can_skip {
                         // if there're normal work in queue, break to fetch the normal work
                         return Err(channel::RecvTimeoutError::Timeout);
                     }

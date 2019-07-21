@@ -1,5 +1,5 @@
 use std::ptr;
-use std::sync::atomic::{self, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 use std::vec;
 
@@ -286,8 +286,8 @@ impl ThreadPool {
             return Err(ExecutionError::Disconnected);
         }
 
-        // if at the hibernation or lazy init mode
-        if status != FLAG_NORMAL {
+        // if at the hibernation or lazy init mode, activate the pool first
+        if status == FLAG_HIBERNATING || status == FLAG_LAZY_INIT {
             self.activate();
         }
 
@@ -305,7 +305,7 @@ impl ThreadPool {
             .map(|busy| {
                 if busy && self.auto_scale {
                     // auto scale by adding more workers to take the job
-                    if let Some(target) = self.resize_target(self.init_size) {
+                    if let Some(target) = self.amortized_new_size(self.init_size) {
                         self.manager.add_workers(
                             target - worker_count,
                             false,
@@ -347,10 +347,8 @@ impl ThreadPool {
     /// }
     /// ```
     pub fn execute<F: FnOnce() + Send + 'static>(&self, f: F) -> Result<(), ExecutionError> {
-        let status = self.status.load();
-
         // we're closing, taking no more jobs.
-        if status == FLAG_CLOSING || status == FLAG_FORCE_CLOSE {
+        if self.status.closing() {
             return Err(ExecutionError::Disconnected);
         }
 
@@ -406,7 +404,7 @@ impl ThreadPool {
         res.map(|_| chan.is_full())
     }
 
-    fn resize_target(&self, queue_length: usize) -> Option<usize> {
+    fn amortized_new_size(&self, queue_length: usize) -> Option<usize> {
         if queue_length == 0 {
             return None;
         }
@@ -617,18 +615,18 @@ impl PoolManager for ThreadPool {
     /// Resize the pool to the desired size. This will either trigger a pool extension or contraction.
     /// Note that if another pool-size changing operation is undergoing, the effect may be cancelled
     /// out if we're moving towards the same direction (adding pool size, or reducing pool size).
-    fn resize(&mut self, total: usize) {
-        if total == 0 {
+    fn resize(&mut self, target: usize) {
+        if target == 0 {
             return;
         }
 
         let worker_count = self.manager.workers_count();
-        if total == worker_count {
+        if target == worker_count {
             return;
-        } else if total > worker_count {
-            self.extend(total - worker_count);
+        } else if target > worker_count {
+            self.extend(target - worker_count);
         } else {
-            self.shrink(worker_count - total);
+            self.shrink(worker_count - target);
         }
     }
 
@@ -637,8 +635,8 @@ impl PoolManager for ThreadPool {
     /// time; if the pool is overwhelmed and need more workers to handle jobs, we will add more threads
     /// to the pool.
     fn auto_adjust(&mut self) {
-        if let Some(change) = self.resize_target(self.get_queue_length()) {
-            self.resize(change);
+        if let Some(target) = self.amortized_new_size(self.get_queue_length()) {
+            self.resize(target);
         }
     }
 
@@ -680,7 +678,24 @@ impl PoolManager for ThreadPool {
     /// in place until new threads are added into the pool, otherwise, the jobs will not be executed
     /// and go away on program exit.
     fn clear(&mut self) {
+        let status = self.status.load();
+        let reset =
+            if status != FLAG_FORCE_CLOSE || status != FLAG_CLOSING {
+                // must update the flag if we've not in proper status
+                self.set_status(FLAG_REST);
+                true
+            } else {
+                // we're in closing status, no need to reset the flag
+                false
+            };
+
+        // remove the workers in sync mode
         self.manager.remove_all(true);
+
+        // reset the flag if required
+        if reset {
+            self.set_status(status);
+        }
     }
 
     /// Signal the threads in the pool that we're closing, but allow them to finish all jobs in the queue
@@ -887,7 +902,13 @@ impl Drop for ThreadPool {
             );
         }
 
-        self.close();
+        // close the pool in sync mode, that's to wait all workers to quit before unblocking
+        if !self.status.closing() {
+            self.close();
+        }
+
+        // now drop the manually allocated stuff
+        unsafe { ptr::drop_in_place(self.status.0.as_ptr()); }
     }
 }
 
@@ -902,6 +923,13 @@ impl PoolStatus {
         PoolStatus(unsafe {
             NonNull::new_unchecked(Box::into_raw(wrapper))
         })
+    }
+
+    fn closing(&self) -> bool {
+        unsafe {
+            // FLAG_CLOSING | FLAG_FORCE_CLOSE == 3
+            self.0.as_ref().fetch_and(3, Ordering::Acquire) > 0
+        }
     }
 
     fn compare_exchange(&self, old: u8, new: u8) -> bool {
@@ -926,16 +954,6 @@ impl PoolStatus {
 impl Clone for PoolStatus {
     fn clone(&self) -> Self {
         PoolStatus(self.0)
-    }
-}
-
-impl Drop for PoolStatus {
-    fn drop(&mut self) {
-        atomic::fence(Ordering::SeqCst);
-
-        unsafe {
-            ptr::drop_in_place(self.0.as_ptr());
-        }
     }
 }
 

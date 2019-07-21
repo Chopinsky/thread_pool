@@ -77,6 +77,7 @@ impl Manager {
         // the behaviors
         let behavior = self.config.worker_behavior();
 
+        // the remove signal should have been sent by now, or this will forever block
         for mut worker in self.workers.drain(..) {
             let id = worker.get_id();
 
@@ -197,6 +198,13 @@ impl Manager {
 
         // return the lock back
         self.reset_lock();
+    }
+}
+
+impl Drop for Manager {
+    fn drop(&mut self) {
+        // now drop the manually allocated stuff
+        unsafe { std::ptr::drop_in_place(self.max_idle.0.as_ptr()); }
     }
 }
 
@@ -488,12 +496,6 @@ impl MaxIdle {
 impl Clone for MaxIdle {
     fn clone(&self) -> Self {
         MaxIdle(self.0)
-    }
-}
-
-impl Drop for MaxIdle {
-    fn drop(&mut self) {
-        unsafe { std::ptr::drop_in_place(self.0.as_ptr()); }
     }
 }
 
