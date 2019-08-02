@@ -1,3 +1,5 @@
+use std::io::ErrorKind;
+use std::ptr;
 use std::sync::atomic::{self, AtomicI8, Ordering};
 use std::thread;
 
@@ -36,6 +38,33 @@ pub(crate) trait FnBox {
 impl<F: FnOnce()> FnBox for F {
     fn call_box(self: Box<F>) {
         (*self)()
+    }
+}
+
+/// The inner storage wrapper struct
+pub(crate) struct StaticStore<T>(Option<T>);
+
+/// The struct that will hold the actual pool. The implementation is sound because all usage is internal
+/// and we're guaranteed that before each call, the real values are actually set ahead.
+impl<T> StaticStore<T> {
+    pub(crate) const fn init() -> Self {
+        StaticStore(None)
+    }
+
+    pub(crate) fn set(&mut self, val: T) {
+        self.0.replace(val);
+    }
+
+    pub(crate) fn as_mut(&mut self) -> Result<&mut T, ErrorKind> {
+        self.0.as_mut().ok_or(ErrorKind::NotFound)
+    }
+}
+
+impl<T> Drop for StaticStore<T> {
+    fn drop(&mut self) {
+        if let Some(mut inner) = self.0.take() {
+            unsafe { ptr::drop_in_place(&mut inner) }
+        }
     }
 }
 

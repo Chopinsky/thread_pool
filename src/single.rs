@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use std::io::ErrorKind;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::thread::JoinHandle;
@@ -8,12 +9,17 @@ use std::time::Duration;
 
 use crate::config::{Config, ConfigStatus};
 use crate::debug::is_debug_mode;
+use crate::model::StaticStore;
 use crate::scheduler::{PoolManager, ThreadPool};
 use parking_lot::{Once, OnceState, ONCE_INIT};
 
+/// Atomic flags
 static ONCE: Once = ONCE_INIT;
 static CLOSING: AtomicBool = AtomicBool::new(false);
-static mut POOL: Option<Pool> = None;
+
+/// The actual pool storage
+static mut POOL: StaticStore<Pool> = StaticStore::init();
+//static mut POOL: Option<Pool> = None;
 //static mut S_POOL: MaybeUninit<Pool> = MaybeUninit::new(Pool::default());
 
 struct Pool {
@@ -24,21 +30,21 @@ struct Pool {
 
 impl Pool {
     #[inline]
-    fn inner() -> Option<&'static mut Pool> {
+    fn inner() -> Result<&'static mut Pool, ErrorKind> {
         if !CLOSING.load(Ordering::Acquire) {
             unsafe { POOL.as_mut() }
         } else {
-            None
+            Err(ErrorKind::PermissionDenied)
         }
     }
 
-    fn take() -> Option<&'static mut Pool> {
+    fn take() -> Result<&'static mut Pool, ErrorKind> {
         if CLOSING.compare_exchange_weak(false, true, Ordering::SeqCst, Ordering::Relaxed)
             == Ok(false)
         {
             unsafe { POOL.as_mut() }
         } else {
-            None
+            Err(ErrorKind::PermissionDenied)
         }
     }
 
@@ -102,17 +108,17 @@ pub fn init_with_config(size: usize, config: Config) {
 
 pub fn run<F: FnOnce() + Send + 'static>(f: F) {
     match Pool::inner() {
-        Some(pool) => {
+        Ok(pool) => {
             if pool.store.exec(f, false).is_err() && is_debug_mode() {
                 eprintln!("The execution of this job has failed...");
             }
         }
-        None => {
+        Err(e) => {
             // This could happen after the pool is closed, just execute the job
             thread::spawn(f);
 
             if is_debug_mode() {
-                eprintln!("The pool has been poisoned... The thread pool should be restarted...");
+                eprintln!("The pool is in invalid state: {:?}, the thread pool should be restarted...", e);
             }
         }
     };
@@ -132,7 +138,7 @@ pub fn resize(size: usize) -> JoinHandle<()> {
             close();
         }
 
-        if let Some(pool) = Pool::inner() {
+        if let Ok(pool) = Pool::inner() {
             pool.store.resize(size);
             return;
         }
@@ -142,7 +148,7 @@ pub fn resize(size: usize) -> JoinHandle<()> {
 }
 
 pub fn update_auto_adjustment_mode(enabled: bool) {
-    if let Some(pool) = Pool::inner() {
+    if let Ok(pool) = Pool::inner() {
         if pool.auto_mode == enabled {
             return;
         }
@@ -156,7 +162,7 @@ pub fn update_auto_adjustment_mode(enabled: bool) {
 }
 
 pub fn reset_auto_adjustment_period(period: Option<Duration>) {
-    if let Some(pool) = Pool::inner() {
+    if let Ok(pool) = Pool::inner() {
         // stop the previous auto job regardless
         stop_auto_adjustment(pool);
 
@@ -169,7 +175,7 @@ pub fn reset_auto_adjustment_period(period: Option<Duration>) {
 }
 
 fn trigger_auto_adjustment() {
-    if let Some(pool) = Pool::inner() {
+    if let Ok(pool) = Pool::inner() {
         pool.store.auto_adjust();
     }
 }
@@ -221,7 +227,7 @@ fn create(size: usize, config: Config) {
 
     // Put it in the heap so it can outlive this call
     unsafe {
-        POOL.replace(Pool {
+        POOL.set(Pool {
             store,
             auto_mode,
             auto_adjust_handler: handler,
@@ -243,7 +249,7 @@ fn shut_down(forced: bool) {
             panic!("The pool can't be closed while it's still being initializing...")
         }
         OnceState::Done => {
-            if let Some(pool_inner) = Pool::take() {
+            if let Ok(pool_inner) = Pool::take() {
                 if !forced {
                     pool_inner.store.close();
                 } else {

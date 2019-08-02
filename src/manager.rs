@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use std::ptr::NonNull;
+use std::ptr::{self, NonNull};
 use std::sync::{atomic::AtomicI8, Arc};
 
 use crate::config::{Config, ConfigStatus};
@@ -496,6 +496,12 @@ impl MaxIdle {
 impl Clone for MaxIdle {
     fn clone(&self) -> Self {
         MaxIdle(self.0)
+    }
+}
+
+impl Drop for MaxIdle {
+    fn drop(&mut self) {
+        unsafe { ptr::drop_in_place(&mut self.0); }
     }
 }
 
