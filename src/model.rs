@@ -1,5 +1,7 @@
+#![allow(unused)]
+
 use std::io::ErrorKind;
-use std::ptr;
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{self, AtomicI8, Ordering};
 use std::thread;
 
@@ -11,7 +13,9 @@ pub(crate) const FLAG_HIBERNATING: u8 = 4;
 pub(crate) const FLAG_LAZY_INIT: u8 = 8;
 pub(crate) const FLAG_REST: u8 = 16;
 pub(crate) const EXPIRE_PERIOD: usize = 64;
+
 const BACKOFF_RETRY_LIMIT: usize = 16;
+const ERR_MSG: &str = "Undefined behavior: the pool has been invoked without being initialized ...";
 
 // Enum ...
 pub(crate) enum Message {
@@ -51,19 +55,42 @@ impl<T> StaticStore<T> {
         StaticStore(None)
     }
 
+    pub(crate) fn as_mut(&mut self) -> Result<&mut T, ErrorKind> {
+        self.0.as_mut().ok_or(ErrorKind::NotFound)
+    }
+
+    pub(crate) fn as_ref(&self) -> Result<&T, ErrorKind> {
+        self.0.as_ref().ok_or(ErrorKind::NotFound)
+    }
+
     pub(crate) fn set(&mut self, val: T) {
         self.0.replace(val);
     }
 
-    pub(crate) fn as_mut(&mut self) -> Result<&mut T, ErrorKind> {
-        self.0.as_mut().ok_or(ErrorKind::NotFound)
+    pub(crate) fn take(&mut self) -> Option<T> {
+        self.0.take()
+    }
+}
+
+impl<T> Deref for StaticStore<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect(ERR_MSG)
+    }
+}
+
+impl<T> DerefMut for StaticStore<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_mut().expect(ERR_MSG)
     }
 }
 
 impl<T> Drop for StaticStore<T> {
     fn drop(&mut self) {
-        if let Some(mut inner) = self.0.take() {
-            unsafe { ptr::drop_in_place(&mut inner) }
+        if let Some(inner) = self.0.take() {
+            // manually call the drop before we leave
+            drop(inner);
         }
     }
 }
