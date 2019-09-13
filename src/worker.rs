@@ -319,7 +319,7 @@ impl Worker {
         let mut idle = None;
         if since.is_some() {
             idle = Worker::calc_idle(&since);
-            *since = Some(SystemTime::now());
+            since.replace(SystemTime::now());
         }
 
         idle

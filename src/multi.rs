@@ -352,7 +352,7 @@ fn trigger_auto_adjustment() {
 fn shut_down(forced: bool) {
     match ONCE.state() {
         OnceState::InProgress => {
-            panic!("The pool can't be closed while it's still being initializing...")
+            panic!("The pool can't be closed while it's still being initializing...");
         }
         OnceState::Done => {
             if let Ok(pool_inner) = PoolStore::take() {
@@ -365,6 +365,6 @@ fn shut_down(forced: bool) {
                 });
             }
         }
-        _ => return,
+        _ => (),
     }
 }

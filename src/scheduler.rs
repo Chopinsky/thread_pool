@@ -621,11 +621,9 @@ impl PoolManager for ThreadPool {
         }
 
         let worker_count = self.manager.workers_count();
-        if target == worker_count {
-            return;
-        } else if target > worker_count {
+        if target > worker_count {
             self.extend(target - worker_count);
-        } else {
+        } else if target < worker_count {
             self.shrink(worker_count - target);
         }
     }
