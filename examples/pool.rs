@@ -31,7 +31,18 @@ fn main() {
         }, false).ok();
     }
 
-    println!("All jobs are sent...");
+    println!("All jobs are sent, now blocking on ...");
+
+    let result = pool.block_on(|| {
+        let mut sum = 0;
+        for i in 0..100 {
+            sum += i * i;
+        }
+
+        sum
+    }).unwrap_or_default();
+
+    println!("The block on is released with result: {}", result);
 
     pool.clear();
     println!("All workers cleared...");

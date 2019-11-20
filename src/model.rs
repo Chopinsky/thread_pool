@@ -4,6 +4,7 @@ use std::io::ErrorKind;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{self, AtomicI8, Ordering};
 use std::thread;
+use crossbeam_channel::Sender;
 
 // Constant flags
 pub(crate) const FLAG_NORMAL: u8 = 0;
@@ -19,12 +20,13 @@ const ERR_MSG: &str = "Undefined behavior: the pool has been invoked without bei
 
 // Enum ...
 pub(crate) enum Message {
-    NewJob(Job),
+    ThroughJob(Job),
     Terminate(Vec<usize>),
 }
 
 // Base types
 pub(crate) type Job = Box<dyn FnBox + Send + 'static>;
+pub(crate) type BlockJob<R> = Box<dyn FnResBox<R> + Send + 'static>;
 pub(crate) type WorkerUpdate = fn(id: usize);
 
 // Traits
@@ -38,9 +40,19 @@ pub(crate) trait FnBox {
     fn call_box(self: Box<Self>);
 }
 
+pub(crate) trait FnResBox<R> {
+    fn call_box(self: Box<Self>) -> R;
+}
+
 // Impl
 impl<F: FnOnce()> FnBox for F {
     fn call_box(self: Box<F>) {
+        (*self)()
+    }
+}
+
+impl<R: Send, F: FnOnce() -> R> FnResBox<R> for F {
+    fn call_box(self: Box<Self>) -> R {
         (*self)()
     }
 }

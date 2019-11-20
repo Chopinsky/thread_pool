@@ -1,7 +1,7 @@
 use std::env;
-use std::sync::{Once, ONCE_INIT};
+use std::sync::Once;
 
-static ONCE: Once = ONCE_INIT;
+static ONCE: Once = Once::new();
 static mut DEBUG: bool = false;
 
 #[inline(always)]

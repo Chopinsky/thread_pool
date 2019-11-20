@@ -1,14 +1,15 @@
 use std::ptr;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
+use std::thread;
 use std::vec;
 
 use crate::config::{Config, ConfigStatus, TimeoutPolicy};
 use crate::debug::is_debug_mode;
 use crate::manager::*;
 use crate::model::*;
-use channel::{SendError, SendTimeoutError, Sender, TrySendError};
 use crossbeam_channel as channel;
+use channel::{SendError, SendTimeoutError, Sender, TrySendError, TryRecvError};
 use std::ptr::NonNull;
 
 const RETRY_LIMIT: u8 = 4;
@@ -301,7 +302,7 @@ impl ThreadPool {
         let retry = if self.auto_scale { 1 } else { 0 };
 
         // send the job for execution
-        self.dispatch(Message::NewJob(Box::new(f)), retry, prioritized)
+        self.dispatch(Message::ThroughJob(Box::new(f)), retry, prioritized)
             .map(|busy| {
                 if busy && self.auto_scale {
                     // auto scale by adding more workers to take the job
@@ -360,11 +361,33 @@ impl ThreadPool {
         // send the job to the queue for execution. note that if we're in hibernation, the queue
         // will still take the new job, though no worker will be awaken to take the job.
         let prioritized = self.chan.1.is_empty() && !self.chan.0.is_full();
-        self.dispatch(Message::NewJob(Box::new(f)), 0, prioritized)
+        self.dispatch(Message::ThroughJob(Box::new(f)), 0, prioritized)
             .map(|_| {})
             .map_err(|err| match err {
                 SendTimeoutError::Timeout(_) => ExecutionError::Timeout,
                 SendTimeoutError::Disconnected(_) => ExecutionError::Disconnected,
+            })
+    }
+
+    pub fn block_on<R: Send + 'static, F: FnOnce() -> R + Send + 'static>(&self, f: F) -> Result<R, ExecutionError> {
+        let curr = thread::current();
+        let (tx, rx) = channel::bounded(1);
+
+        thread::spawn(move || {
+            tx.send(f()).unwrap_or_default();
+            curr.unpark();
+        });
+
+        // timeout after 8 seconds of no responses ...
+        thread::park_timeout(Duration::from_secs(8));
+
+        rx
+            .try_recv()
+            .map_err(|err| {
+                match err {
+                    TryRecvError::Empty => ExecutionError::Timeout,
+                    TryRecvError::Disconnected => ExecutionError::Disconnected,
+                }
             })
     }
 
@@ -831,7 +854,7 @@ impl DispatchFlavors for ThreadPool {
                         TimeoutPolicy::DirectRun => {
                             // directly run the job; the termination message will not be
                             // sent in this workflow, so we shall not worry about that.
-                            if let Message::NewJob(job) = retry_message {
+                            if let Message::ThroughJob(job) = retry_message {
                                 job.call_box();
                             }
 

@@ -327,7 +327,7 @@ impl Worker {
 
     fn unpack_message(message: Message) -> (Option<Job>, Option<Vec<usize>>) {
         match message {
-            Message::NewJob(job) => (Some(job), None),
+            Message::ThroughJob(job) => (Some(job), None),
             Message::Terminate(target) => (None, Some(target)),
         }
     }
