@@ -369,7 +369,7 @@ impl ThreadPool {
             })
     }
 
-    pub fn block_on<R: Send + 'static, F: FnOnce() -> R + Send + 'static>(&self, f: F) -> Result<R, ExecutionError> {
+    pub fn sync_block<R: Send + 'static, F: FnOnce() -> R + Send + 'static>(&self, f: F) -> Result<R, ExecutionError> {
         let curr = thread::current();
         let (tx, rx) = channel::bounded(1);
 
