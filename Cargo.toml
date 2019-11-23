@@ -2,7 +2,7 @@
 name = "threads_pool"
 description = "This package provides an easy way to create and manage thread pools, so you don't have to."
 authors = ["Jacob Zuo <chopinsky@live.com>"]
-version = "0.2.4"
+version = "0.3.0"
 readme = "README.md"
 documentation = "https://docs.rs/thread_pool/"
 repository = "https://github.com/Chopinsky/thread_pool.git"
@@ -13,6 +13,8 @@ edition = "2018"
 crossbeam-channel = "^0.3.0"
 hashbrown = "^0.1.8"
 parking_lot = "^0.7.1"
+futures-executor = "0.3.1"
+futures-util = "0.3.1"
 
 [dev-dependencies]
 criterion = "0.2"

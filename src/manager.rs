@@ -39,9 +39,7 @@ impl Manager {
         lazy_built: bool,
     ) -> Manager {
         let idle = Box::new(EXPIRE_PERIOD);
-        let max_idle = MaxIdle(unsafe {
-            NonNull::new_unchecked(Box::into_raw(idle))
-        });
+        let max_idle = MaxIdle(unsafe { NonNull::new_unchecked(Box::into_raw(idle)) });
 
         let mut m = Manager {
             config,
@@ -204,7 +202,9 @@ impl Manager {
 impl Drop for Manager {
     fn drop(&mut self) {
         // now drop the manually allocated stuff
-        unsafe { std::ptr::drop_in_place(self.max_idle.0.as_ptr()); }
+        unsafe {
+            std::ptr::drop_in_place(self.max_idle.0.as_ptr());
+        }
     }
 }
 
@@ -501,7 +501,9 @@ impl Clone for MaxIdle {
 
 impl Drop for MaxIdle {
     fn drop(&mut self) {
-        unsafe { ptr::drop_in_place(&mut self.0); }
+        unsafe {
+            ptr::drop_in_place(&mut self.0);
+        }
     }
 }
 

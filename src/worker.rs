@@ -1,14 +1,17 @@
 #![allow(dead_code)]
 
+use std::future::Future;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime};
 
 use crate::debug::is_debug_mode;
-use crate::manager::{StatusBehaviorDefinitions, StatusBehaviors, MaxIdle};
+use crate::manager::{MaxIdle, StatusBehaviorDefinitions, StatusBehaviors};
 use crate::model::*;
 use crate::scheduler::PoolStatus;
 use crossbeam_channel as channel;
+use futures_executor::{LocalPool, LocalSpawner};
+use futures_util::task::LocalSpawnExt;
 use hashbrown::HashSet;
 use parking_lot::RwLock;
 
@@ -18,9 +21,41 @@ const LOT_COUNTS: usize = 3;
 const LONG_PARKING_ROUNDS: u8 = 8;
 const SHORT_PARKING_ROUNDS: u8 = 2;
 
+struct FutWorker {
+    local_pool: LocalPool,
+    tasks_queue: LocalSpawner,
+    tasks_counter: usize,
+}
+
+impl FutWorker {
+    fn push<F: Future<Output = ()> + Send + 'static>(&mut self, job: F) -> Result<(), String> {
+        self.tasks_queue
+            .spawn_local(job)
+            .and_then(|_| {
+                self.tasks_counter += 1;
+                Ok(())
+            })
+            .map_err(|_| String::from("The futures pool has been shutdown ... "))
+    }
+
+    fn run(&mut self) -> bool {
+        while self.tasks_counter > 0 && self.local_pool.try_run_one() {
+            self.tasks_counter -= 1;
+        }
+
+        self.tasks_counter == 0
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.tasks_counter == 0
+    }
+}
+
 pub(crate) struct Worker {
     id: usize,
     thread: Option<thread::JoinHandle<()>>,
+    fut_worker: FutWorker,
     before_drop: Option<WorkerUpdate>,
     after_drop: Option<WorkerUpdate>,
 }
@@ -45,9 +80,19 @@ impl Worker {
 
         behavior_definition.after_start(my_id);
 
+        let local_pool = LocalPool::new();
+        let tasks_queue = local_pool.spawner();
+
+        let fut_worker = FutWorker {
+            local_pool,
+            tasks_queue,
+            tasks_counter: 0,
+        };
+
         Worker {
             id: my_id,
             thread: Some(worker),
+            fut_worker,
             before_drop: behavior_definition.before_drop_clone(),
             after_drop: behavior_definition.after_drop_clone(),
         }
@@ -98,118 +143,123 @@ impl Worker {
             builder = builder.stack_size(stack_size);
         }
 
-        builder.spawn(move || {
-            let mut done: bool;
-            let mut status: u8;
-            let mut pri_work_count: u8 = 0;
+        builder
+            .spawn(move || {
+                let mut done: bool;
+                let mut status: u8;
+                let mut pri_work_count: u8 = 0;
 
-            let mut since = if privileged {
-                None
-            } else {
-                Some(SystemTime::now())
-            };
-
-            // unpack the shared info triple
-            let (graveyard, pool_status, max_idle) = shared_info;
-            let (pri_wait, norm_wait) = match my_id % LOT_COUNTS {
-                0 => (true, false),
-                1 => (false, true),
-                _ => (false, false),
-            };
-
-            // main worker loop
-            loop {
-                // get ready to take new work from the channel
-                {
-                    if graveyard.read().contains(&my_id) {
-                        // async universal kill, or a targeted kill, either way, we shall quit
-                        return;
-                    }
-                }
-
-                // get the pool status code
-                status = pool_status.load();
-                if status == FLAG_FORCE_CLOSE
-                    || ((status == FLAG_CLOSING || status == FLAG_REST) && rx_pair.0.is_empty() && rx_pair.1.is_empty())
-                {
-                    // if shutting down, check if we can abandon all work by checking forced
-                    // close flag, or when all work have been processed.
-                    return;
-                }
-
-                // wait for work loop
-                let (work, target) = match Worker::check_queues(
-                    &rx_pair.0,
-                    &rx_pair.1,
-                    pri_wait,
-                    norm_wait,
-                    &mut pri_work_count,
-                ) {
-                    // if the channels are disconnected, return
-                    WorkStatus(-1, _, _) => return,
-                    WorkStatus(_, job, target) => (job, target),
+                let mut since = if privileged {
+                    None
+                } else {
+                    Some(SystemTime::now())
                 };
 
-                // if there's a job, get it done first, and calc the idle period since last actual job
-                done = work
-                    .and_then(|job| {
-                        // if we have work, do them now
-                        Worker::handle_work(job, &mut since)
-                    })
-                    .or_else(|| {
-                        // if we don't have the work, calculate the idle period
-                        Worker::calc_idle(&since)
-                    })
-                    .and_then(|idle| {
-                        // if idled longer than the expected worker life for unprivileged workers,
-                        // then we're done now -- self-purging.
-                        if max_idle.expired(&idle.as_millis()) {
-                            // mark self as a voluntary retiree
-                            graveyard.write().insert(my_id);
-                            return Some(());
+                // unpack the shared info triple
+                let (graveyard, pool_status, max_idle) = shared_info;
+                let (pri_wait, norm_wait) = match my_id % LOT_COUNTS {
+                    0 => (true, false),
+                    1 => (false, true),
+                    _ => (false, false),
+                };
+
+                // main worker loop
+                loop {
+                    // get ready to take new work from the channel
+                    {
+                        if graveyard.read().contains(&my_id) {
+                            // async universal kill, or a targeted kill, either way, we shall quit
+                            return;
                         }
+                    }
 
-                        None
-                    })
-                    .is_some();
+                    // get the pool status code
+                    status = pool_status.load();
+                    if status == FLAG_FORCE_CLOSE
+                        || ((status == FLAG_CLOSING || status == FLAG_REST)
+                            && rx_pair.0.is_empty()
+                            && rx_pair.1.is_empty())
+                    {
+                        // if shutting down, check if we can abandon all work by checking forced
+                        // close flag, or when all work have been processed.
+                        return;
+                    }
 
-                // if not done and it's a target kill, handle it now
-                done = done || target
-                    .and_then(|id_slice| {
-                        if id_slice.is_empty() {
-                            return None;
-                        }
+                    // wait for work loop
+                    let (work, target) = match Worker::check_queues(
+                        &rx_pair.0,
+                        &rx_pair.1,
+                        pri_wait,
+                        norm_wait,
+                        &mut pri_work_count,
+                    ) {
+                        // if the channels are disconnected, return
+                        WorkStatus(-1, _, _) => return,
+                        WorkStatus(_, job, target) => (job, target),
+                    };
 
-                        // write and done, keep the write lock scoped and update the graveyard
-                        let mut found = false;
-                        let mut g = graveyard.write();
+                    // if there's a job, get it done first, and calc the idle period since last actual job
+                    done = work
+                        .and_then(|job| {
+                            // if we have work, do them now
+                            Worker::handle_work(job, &mut since)
+                        })
+                        .or_else(|| {
+                            // if we don't have the work, calculate the idle period
+                            Worker::calc_idle(&since)
+                        })
+                        .and_then(|idle| {
+                            // if idled longer than the expected worker life for unprivileged workers,
+                            // then we're done now -- self-purging.
+                            if max_idle.expired(&idle.as_millis()) {
+                                // mark self as a voluntary retiree
+                                graveyard.write().insert(my_id);
+                                return Some(());
+                            }
 
-                        for id in id_slice {
-                            // update graveyard for clean up purposes
-                            g.insert(id);
+                            None
+                        })
+                        .is_some();
 
-                            // only receiving the universal kill-signal from closing the channel
-                            found = found || id == my_id;
-                        }
+                    // if not done and it's a target kill, handle it now
+                    done = done
+                        || target
+                            .and_then(|id_slice| {
+                                if id_slice.is_empty() {
+                                    return None;
+                                }
 
-                        // if my id or a forced kill, just quit
-                        if found {
-                            return Some(());
-                        }
+                                // write and done, keep the write lock scoped and update the graveyard
+                                let mut found = false;
+                                let mut g = graveyard.write();
 
-                        None
-                    })
-                    .is_some();
+                                for id in id_slice {
+                                    // update graveyard for clean up purposes
+                                    g.insert(id);
 
-                if done {
-                    return;
+                                    // only receiving the universal kill-signal from closing the channel
+                                    found = found || id == my_id;
+                                }
+
+                                // if my id or a forced kill, just quit
+                                if found {
+                                    return Some(());
+                                }
+
+                                None
+                            })
+                            .is_some();
+
+                    if done {
+                        return;
+                    }
+
+                    if status == FLAG_HIBERNATING {
+                        thread::park();
+                    }
                 }
-
-                if status == FLAG_HIBERNATING {
-                    thread::park();
-                }
-            }
-        }).unwrap()
+            })
+            .unwrap()
     }
 
     fn check_queues(
@@ -328,6 +378,9 @@ impl Worker {
     fn unpack_message(message: Message) -> (Option<Job>, Option<Vec<usize>>) {
         match message {
             Message::ThroughJob(job) => (Some(job), None),
+            Message::FutureJob(_job) => {
+                unimplemented!();
+            }
             Message::Terminate(target) => (None, Some(target)),
         }
     }

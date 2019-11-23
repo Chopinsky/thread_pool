@@ -2,17 +2,23 @@
 extern crate criterion;
 extern crate threads_pool;
 
-use std::sync::atomic;
 use criterion::{black_box, Criterion};
+use std::sync::atomic;
 use threads_pool::prelude::*;
 
 fn pool_base(size: usize, bound: usize) {
     let mut pool = ThreadPool::new(size);
 
     for num in 1..bound {
-        pool
-            .exec(move || for _ in 1..num%4 { atomic::spin_loop_hint(); }, false)
-            .unwrap_or_default();
+        pool.exec(
+            move || {
+                for _ in 1..num % 4 {
+                    atomic::spin_loop_hint();
+                }
+            },
+            false,
+        )
+        .unwrap_or_default();
     }
 
     pool.close();
@@ -31,7 +37,11 @@ fn single_bench(c: &mut Criterion) {
     c.bench_function("base single mode measurement", move |b| {
         b.iter(|| {
             for num in 1..bound {
-                shared_mode::run(move || for _ in 1..num%16 { atomic::spin_loop_hint(); });
+                shared_mode::run(move || {
+                    for _ in 1..num % 16 {
+                        atomic::spin_loop_hint();
+                    }
+                });
             }
         })
     });

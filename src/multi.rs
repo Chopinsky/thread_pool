@@ -9,7 +9,7 @@ use std::time::Duration;
 use crate::config::{Config, ConfigStatus};
 use crate::debug::is_debug_mode;
 use crate::model::{concede_update, reset_lock, spin_update, Backoff, StaticStore};
-use crate::scheduler::{ThreadPool, PoolManager, PoolState};
+use crate::scheduler::{PoolManager, PoolState, ThreadPool};
 use hashbrown::{HashMap, HashSet};
 use parking_lot::{Once, OnceState, ONCE_INIT};
 
@@ -135,7 +135,10 @@ pub fn run_with<F: FnOnce() + Send + 'static>(key: String, f: F) {
             thread::spawn(f);
 
             if is_debug_mode() {
-                eprintln!("The pool is in invalid state: {:?}, the thread pool should be restarted...", e);
+                eprintln!(
+                    "The pool is in invalid state: {:?}, the thread pool should be restarted...",
+                    e
+                );
             }
         }
     };

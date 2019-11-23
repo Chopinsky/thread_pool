@@ -1,16 +1,15 @@
-use std::ptr;
+use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::time::Duration;
 use std::thread;
+use std::time::Duration;
 use std::vec;
 
 use crate::config::{Config, ConfigStatus, TimeoutPolicy};
 use crate::debug::is_debug_mode;
 use crate::manager::*;
 use crate::model::*;
+use channel::{SendError, SendTimeoutError, Sender, TryRecvError, TrySendError};
 use crossbeam_channel as channel;
-use channel::{SendError, SendTimeoutError, Sender, TrySendError, TryRecvError};
-use std::ptr::NonNull;
 
 const RETRY_LIMIT: u8 = 4;
 const CHAN_CAP: usize = 16;
@@ -205,11 +204,8 @@ impl ThreadPool {
         let workers_count = self.manager.workers_count();
         if workers_count < self.init_size {
             // lazy init the pool at the first job, or regenerate workers when all are purged
-            self.manager.add_workers(
-                self.init_size - workers_count,
-                true,
-                self.status.clone(),
-            );
+            self.manager
+                .add_workers(self.init_size - workers_count, true, self.status.clone());
         }
 
         // update the status after activation.
@@ -307,11 +303,8 @@ impl ThreadPool {
                 if busy && self.auto_scale {
                     // auto scale by adding more workers to take the job
                     if let Some(target) = self.amortized_new_size(self.init_size) {
-                        self.manager.add_workers(
-                            target - worker_count,
-                            false,
-                            self.status.clone(),
-                        );
+                        self.manager
+                            .add_workers(target - worker_count, false, self.status.clone());
                     }
                 }
             })
@@ -369,7 +362,10 @@ impl ThreadPool {
             })
     }
 
-    pub fn sync_block<R: Send + 'static, F: FnOnce() -> R + Send + 'static>(&self, f: F) -> Result<R, ExecutionError> {
+    pub fn sync_block<R: Send + 'static, F: FnOnce() -> R + Send + 'static>(
+        &self,
+        f: F,
+    ) -> Result<R, ExecutionError> {
         let curr = thread::current();
         let (tx, rx) = channel::bounded(1);
 
@@ -381,14 +377,10 @@ impl ThreadPool {
         // timeout after 8 seconds of no responses ...
         thread::park_timeout(Duration::from_secs(8));
 
-        rx
-            .try_recv()
-            .map_err(|err| {
-                match err {
-                    TryRecvError::Empty => ExecutionError::Timeout,
-                    TryRecvError::Disconnected => ExecutionError::Disconnected,
-                }
-            })
+        rx.try_recv().map_err(|err| match err {
+            TryRecvError::Empty => ExecutionError::Timeout,
+            TryRecvError::Disconnected => ExecutionError::Disconnected,
+        })
     }
 
     fn dispatch(
@@ -468,7 +460,10 @@ impl ThreadPool {
         }
 
         if is_debug_mode() {
-            println!("Remainder work before shutdown signal: {}", self.chan.0.len() + self.chan.1.len());
+            println!(
+                "Remainder work before shutdown signal: {}",
+                self.chan.0.len() + self.chan.1.len()
+            );
         }
 
         self.clear();
@@ -487,17 +482,13 @@ impl ThreadPool {
         let non_blocking = config.non_blocking();
         let policy = config.timeout_policy();
 
-        let flag = PoolStatus::new(
-            if !lazy_built {
-                FLAG_NORMAL
-            } else {
-                FLAG_LAZY_INIT
-            }
-        );
+        let flag = PoolStatus::new(if !lazy_built {
+            FLAG_NORMAL
+        } else {
+            FLAG_LAZY_INIT
+        });
 
-        let manager = Manager::build(
-            config, pool_size, flag.clone(), pri_rx, rx, lazy_built
-        );
+        let manager = Manager::build(config, pool_size, flag.clone(), pri_rx, rx, lazy_built);
 
         ThreadPool {
             manager,
@@ -700,15 +691,14 @@ impl PoolManager for ThreadPool {
     /// and go away on program exit.
     fn clear(&mut self) {
         let status = self.status.load();
-        let reset =
-            if status != FLAG_FORCE_CLOSE || status != FLAG_CLOSING {
-                // must update the flag if we've not in proper status
-                self.set_status(FLAG_REST);
-                true
-            } else {
-                // we're in closing status, no need to reset the flag
-                false
-            };
+        let reset = if status != FLAG_FORCE_CLOSE || status != FLAG_CLOSING {
+            // must update the flag if we've not in proper status
+            self.set_status(FLAG_REST);
+            true
+        } else {
+            // we're in closing status, no need to reset the flag
+            false
+        };
 
         // remove the workers in sync mode
         self.manager.remove_all(true);
@@ -929,7 +919,9 @@ impl Drop for ThreadPool {
         }
 
         // now drop the manually allocated stuff
-        unsafe { ptr::drop_in_place(self.status.0.as_ptr()); }
+        unsafe {
+            ptr::drop_in_place(self.status.0.as_ptr());
+        }
     }
 }
 
@@ -941,9 +933,7 @@ pub(crate) struct PoolStatus(NonNull<AtomicU8>);
 impl PoolStatus {
     fn new(val: u8) -> Self {
         let wrapper = Box::new(AtomicU8::new(val));
-        PoolStatus(unsafe {
-            NonNull::new_unchecked(Box::into_raw(wrapper))
-        })
+        PoolStatus(unsafe { NonNull::new_unchecked(Box::into_raw(wrapper)) })
     }
 
     fn closing(&self) -> bool {
@@ -963,7 +953,9 @@ impl PoolStatus {
     }
 
     fn store(&self, new: u8) {
-        unsafe { self.0.as_ref().store(new, Ordering::SeqCst); }
+        unsafe {
+            self.0.as_ref().store(new, Ordering::SeqCst);
+        }
     }
 
     #[inline]

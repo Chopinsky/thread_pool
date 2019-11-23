@@ -118,7 +118,10 @@ pub fn run<F: FnOnce() + Send + 'static>(f: F) {
             thread::spawn(f);
 
             if is_debug_mode() {
-                eprintln!("The pool is in invalid state: {:?}, the thread pool should be restarted...", e);
+                eprintln!(
+                    "The pool is in invalid state: {:?}, the thread pool should be restarted...",
+                    e
+                );
             }
         }
     };
