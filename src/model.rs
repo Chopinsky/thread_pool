@@ -1,11 +1,12 @@
 #![allow(unused)]
 
-use crossbeam_channel::Sender;
-use std::future::Future;
 use std::io::ErrorKind;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{self, AtomicI8, Ordering};
-use std::thread;
+use std::sync::{Arc, atomic::{self, AtomicI8, Ordering}};
+use std::future::Future;
+use std::thread::{self, Thread};
+use std::time::Duration;
+use crossbeam_channel::Sender;
 
 // Constant flags
 pub(crate) const FLAG_NORMAL: u8 = 0;
@@ -22,13 +23,14 @@ const ERR_MSG: &str = "Undefined behavior: the pool has been invoked without bei
 // Enum ...
 pub(crate) enum Message {
     ThroughJob(Job),
-    FutureJob(FutureJob),
+    FutureJob(FutJob),
     Terminate(Vec<usize>),
 }
 
 // Base types
 pub(crate) type Job = Box<dyn FnBox + Send + 'static>;
-pub(crate) type FutureJob = Box<dyn Future<Output = ()> + Send + 'static>;
+pub(crate) type FutJob = Box<dyn Future<Output = ()> + Send + 'static>;
+//pub(crate) type FutJob = Box<LocalFutureObj<'static, ()>> + Send>;
 pub(crate) type BlockJob<R> = Box<dyn FnResBox<R> + Send + 'static>;
 pub(crate) type WorkerUpdate = fn(id: usize);
 
@@ -153,3 +155,5 @@ pub(crate) fn cpu_relax(count: usize) {
         atomic::spin_loop_hint()
     }
 }
+
+// Future related

@@ -15,6 +15,7 @@ hashbrown = "^0.1.8"
 parking_lot = "^0.7.1"
 futures-executor = "0.3.1"
 futures-util = "0.3.1"
+futures-task = "0.3.1"
 
 [dev-dependencies]
 criterion = "0.2"

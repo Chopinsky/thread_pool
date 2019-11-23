@@ -1,3 +1,5 @@
+use std::future::Future;
+//use std::mem;
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::thread;
@@ -8,8 +10,10 @@ use crate::config::{Config, ConfigStatus, TimeoutPolicy};
 use crate::debug::is_debug_mode;
 use crate::manager::*;
 use crate::model::*;
-use channel::{SendError, SendTimeoutError, Sender, TryRecvError, TrySendError};
+use channel::{SendError, SendTimeoutError, Sender, TrySendError, TryRecvError};
 use crossbeam_channel as channel;
+//use futures_task::LocalFutureObj;
+//use futures_task::UnsafeFutureObj;
 
 const RETRY_LIMIT: u8 = 4;
 const CHAN_CAP: usize = 16;
@@ -787,6 +791,36 @@ impl PoolState for ThreadPool {
             0 => None,
             id => Some(id),
         }
+    }
+}
+
+pub trait FuturesPool {
+    fn block_on<R: Send + 'static, F: Future<Output = R> + Send + 'static>(&mut self, f: F) -> Result<R, ExecutionError>;
+    fn run<F: Future<Output = ()> + Send + 'static>(&mut self, f: F) -> Result<(), ExecutionError>;
+}
+
+impl FuturesPool for ThreadPool {
+    fn block_on<R: Send + 'static, F: Future<Output = R> + Send + 'static>(&mut self, f: F) -> Result<R, ExecutionError> {
+        let (tx, rx) = channel::bounded(1);
+
+        let fut_wrapper = async move {
+            let res = f.await;
+            tx.send(res).expect("Failed to send the future's result");
+        };
+
+//        let local_fut = LocalFutureObj::new(Box::new(fut_wrapper));
+
+        self
+            .dispatch(Message::FutureJob(Box::new(fut_wrapper)), 1, true)
+            .expect("Failed to dispatch the future to a worker ... ");
+
+        rx.recv().map_err(|_| {
+            ExecutionError::Disconnected
+        })
+    }
+
+    fn run<F: Future<Output = ()> + Send + 'static>(&mut self, f: F) -> Result<(), ExecutionError> {
+        Ok(())
     }
 }
 

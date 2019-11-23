@@ -6,6 +6,7 @@ mod multi;
 mod scheduler;
 mod single;
 mod worker;
+mod local_executor;
 
 pub use crate::{
     config::{Config, ConfigStatus, TimeoutPolicy},
