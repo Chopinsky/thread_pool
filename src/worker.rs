@@ -28,6 +28,17 @@ struct FutWorker {
 }
 
 impl FutWorker {
+    fn new() -> FutWorker {
+        let local_pool = LocalPool::new();
+        let tasks_queue = local_pool.spawner();
+
+        FutWorker {
+            local_pool,
+            tasks_queue,
+            tasks_counter: 0,
+        }
+    }
+
     fn push<F: Future<Output = ()> + Send + 'static>(&mut self, job: F) -> Result<(), String> {
         self.tasks_queue
             .spawn_local(job)
@@ -55,12 +66,11 @@ impl FutWorker {
 pub(crate) struct Worker {
     id: usize,
     thread: Option<thread::JoinHandle<()>>,
-    fut_worker: FutWorker,
     before_drop: Option<WorkerUpdate>,
     after_drop: Option<WorkerUpdate>,
 }
 
-struct WorkStatus(i8, Option<Job>, Option<Vec<usize>>);
+struct WorkStatus(i8, Option<Job>, Option<FutJob>, Option<Vec<usize>>);
 
 impl Worker {
     /// Create and spawn the worker, this will dispatch the worker to listen to work queue immediately
@@ -80,19 +90,9 @@ impl Worker {
 
         behavior_definition.after_start(my_id);
 
-        let local_pool = LocalPool::new();
-        let tasks_queue = local_pool.spawner();
-
-        let fut_worker = FutWorker {
-            local_pool,
-            tasks_queue,
-            tasks_counter: 0,
-        };
-
         Worker {
             id: my_id,
             thread: Some(worker),
-            fut_worker,
             before_drop: behavior_definition.before_drop_clone(),
             after_drop: behavior_definition.after_drop_clone(),
         }
@@ -163,6 +163,8 @@ impl Worker {
                     _ => (false, false),
                 };
 
+                let mut fut_handler = None;
+
                 // main worker loop
                 loop {
                     // get ready to take new work from the channel
@@ -186,7 +188,7 @@ impl Worker {
                     }
 
                     // wait for work loop
-                    let (work, target) = match Worker::check_queues(
+                    let (work, fut_work, target) = match Worker::check_queues(
                         &rx_pair.0,
                         &rx_pair.1,
                         pri_wait,
@@ -194,16 +196,20 @@ impl Worker {
                         &mut pri_work_count,
                     ) {
                         // if the channels are disconnected, return
-                        WorkStatus(-1, _, _) => return,
-                        WorkStatus(_, job, target) => (job, target),
+                        WorkStatus(-1, _, _, _) => return,
+                        WorkStatus(_, job, fut_job, target) =>
+                            (job, fut_job, target),
                     };
 
                     // if there's a job, get it done first, and calc the idle period since last actual job
-                    done = work
-                        .and_then(|job| {
-                            // if we have work, do them now
-                            Worker::handle_work(job, &mut since)
-                        })
+                    done =
+                        // if we have work, do them now
+                        Worker::handle_work(
+                            work,
+                            fut_work,
+                            &mut fut_handler,
+                            &mut since
+                        )
                         .or_else(|| {
                             // if we don't have the work, calculate the idle period
                             Worker::calc_idle(&since)
@@ -279,7 +285,8 @@ impl Worker {
             match Worker::fetch_work(pri_chan, norm_full && !pri_wait) {
                 Ok(message) => {
                     // message is the only place that can update the "done" field
-                    let (job, target) = Worker::unpack_message(message);
+                    let (job, fut_job, target)
+                        = Worker::unpack_message(message);
 
                     if *pri_work_count < 4 {
                         // only add if we're below the continuous pri-work cap
@@ -291,11 +298,11 @@ impl Worker {
                         *pri_work_count = 255;
                     }
 
-                    return WorkStatus(0, job, target);
+                    return WorkStatus(0, job, fut_job, target);
                 }
                 Err(channel::RecvTimeoutError::Disconnected) => {
                     // sender has been dropped
-                    return WorkStatus(-1, None, None);
+                    return WorkStatus(-1, None, None, None);
                 }
                 Err(channel::RecvTimeoutError::Timeout) => {
                     // if chan empty, do nothing and fall through to the normal chan handle
@@ -313,21 +320,21 @@ impl Worker {
         match Worker::fetch_work(norm_chan, pri_chan.is_full() && !norm_wait) {
             Ok(message) => {
                 // message is the only place that can update the "done" field
-                let (job, target) = Worker::unpack_message(message);
+                let (job, fut_job, target) = Worker::unpack_message(message);
                 *pri_work_count = 0;
 
-                return WorkStatus(0, job, target);
+                return WorkStatus(0, job, fut_job, target);
             }
             Err(channel::RecvTimeoutError::Disconnected) => {
                 // sender has been dropped
-                return WorkStatus(-1, None, None);
+                return WorkStatus(-1, None, None, None);
             }
             Err(channel::RecvTimeoutError::Timeout) => {
                 // nothing to receive yet
             }
         };
 
-        WorkStatus(0, None, None)
+        WorkStatus(0, None, None, None)
     }
 
     fn fetch_work(
@@ -363,8 +370,30 @@ impl Worker {
         }
     }
 
-    fn handle_work(work: Job, since: &mut Option<SystemTime>) -> Option<Duration> {
-        work.call_box();
+    fn handle_work(
+        work: Option<Job>,
+        fut_work: Option<FutJob>,
+        fut_handler: &mut Option<FutWorker>,
+        since: &mut Option<SystemTime>
+    ) -> Option<Duration>
+    {
+        match (work, fut_work) {
+            (Some(w), None) => w.call_box(),
+            (None, Some(j)) => {
+                if fut_handler.is_none() {
+                    fut_handler.replace(FutWorker::new());
+                }
+
+                if let Some(handler) = fut_handler {
+                    handler
+                        .push(j)
+                        .expect("Failed to spawn  the future ... ");
+
+                    handler.run();
+                }
+            },
+            _ => return None,
+        }
 
         let mut idle = None;
         if since.is_some() {
@@ -375,13 +404,13 @@ impl Worker {
         idle
     }
 
-    fn unpack_message(message: Message) -> (Option<Job>, Option<Vec<usize>>) {
+    fn unpack_message(message: Message) -> (Option<Job>, Option<FutJob>, Option<Vec<usize>>) {
         match message {
-            Message::ThroughJob(job) => (Some(job), None),
-            Message::FutureJob(_job) => {
-                unimplemented!();
+            Message::ThroughJob(job) => (Some(job), None, None),
+            Message::FutureJob(fut_job) => {
+                (None, Some(fut_job), None)
             }
-            Message::Terminate(target) => (None, Some(target)),
+            Message::Terminate(target) => (None, None, Some(target)),
         }
     }
 

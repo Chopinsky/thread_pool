@@ -38,12 +38,12 @@ where
     });
 }
 
-pub(crate) fn fut_run(f: FutJob) {
-    let mut fut = Pin::from(f); //unsafe { Pin::new_unchecked(&mut f) };
+pub(crate) fn fut_run(mut f: FutJob) {
+//    let mut fut = Pin::from(f);
 
     poll_executor(move |ctx: &mut Context<'_>| {
         loop {
-            if let Poll::Ready(_) = fut.as_mut().poll(ctx) {
+            if let Poll::Ready(_) = f.as_mut().poll(ctx) {
                 return;
             }
 

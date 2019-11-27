@@ -6,6 +6,7 @@ use std::sync::{Arc, atomic::{self, AtomicI8, Ordering}};
 use std::future::Future;
 use std::thread::{self, Thread};
 use std::time::Duration;
+use std::pin::Pin;
 use crossbeam_channel::Sender;
 
 // Constant flags
@@ -29,7 +30,7 @@ pub(crate) enum Message {
 
 // Base types
 pub(crate) type Job = Box<dyn FnBox + Send + 'static>;
-pub(crate) type FutJob = Box<dyn Future<Output = ()> + Send + 'static>;
+pub(crate) type FutJob = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 //pub(crate) type FutJob = Box<LocalFutureObj<'static, ()>> + Send>;
 pub(crate) type BlockJob<R> = Box<dyn FnResBox<R> + Send + 'static>;
 pub(crate) type WorkerUpdate = fn(id: usize);
