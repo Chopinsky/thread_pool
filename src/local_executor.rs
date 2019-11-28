@@ -3,16 +3,15 @@
 use std::pin::Pin;
 use std::sync::Arc;
 use std::thread::{self, Thread};
-use futures_executor::enter;
-use futures_task::{waker_ref, Context, Poll, ArcWake};
 use crate::model::FutJob;
 
 thread_local! {
-    static NOTIFIER: Arc<ThreadNotifier> = Arc::new(ThreadNotifier {
-        thread: thread::current(),
-    });
+//    static NOTIFIER: Arc<ThreadNotifier> = Arc::new(ThreadNotifier {
+//        thread: thread::current(),
+//    });
 }
 
+/*
 pub(crate) struct ThreadNotifier {
     thread: Thread,
 }
@@ -51,3 +50,4 @@ pub(crate) fn fut_run(mut f: FutJob) {
         };
     });
 }
+*/

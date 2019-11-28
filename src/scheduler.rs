@@ -12,10 +12,7 @@ use crate::manager::*;
 use crate::model::*;
 use channel::{SendError, SendTimeoutError, Sender, TrySendError, TryRecvError};
 use crossbeam_channel as channel;
-//use futures_task::LocalFutureObj;
-//use futures_task::UnsafeFutureObj;
-use futures_executor::{LocalPool, LocalSpawner};
-use futures_util::task::LocalSpawnExt;
+use async_task::Task;
 
 const RETRY_LIMIT: u8 = 4;
 const CHAN_CAP: usize = 16;
@@ -121,8 +118,6 @@ pub struct ThreadPool {
     ///     3. LossyRetry -> If we choose to drop oldest tasks when the pool is full, such that we
     ///                      will not block the channels;
     timeout_policy: TimeoutPolicy,
-
-    local_pool: Option<(LocalPool, LocalSpawner)>,
 }
 
 impl ThreadPool {
@@ -498,8 +493,8 @@ impl ThreadPool {
 
         let manager = Manager::build(config, pool_size, flag.clone(), pri_rx, rx, lazy_built);
 
-        let pool = LocalPool::new();
-        let spawner = pool.spawner();
+//        let pool = LocalPool::new();
+//        let spawner = pool.spawner();
 
         ThreadPool {
             manager,
@@ -512,7 +507,7 @@ impl ThreadPool {
             non_blocking,
             queue_timeout: None,
             timeout_policy: policy,
-            local_pool: Some((pool, spawner)),
+//            local_pool: Some((pool, spawner)),
         }
     }
 }
@@ -802,48 +797,31 @@ impl PoolState for ThreadPool {
     }
 }
 
-pub trait FuturesPool {
-    fn block_on<R: Send + 'static, F: Future<Output = R>+ Send + Unpin + 'static>(&mut self, f: F) -> Result<R, ExecutionError>;
-    fn spawn<F: Future<Output = ()> + 'static>(&self, f: F) -> Result<(), ExecutionError>;
-    fn run(&mut self);
+pub trait FuturesPool<T, F>
+    where
+        T: Send + 'static,
+        F: Future<Output = T> + Send + 'static,
+{
+    fn block_on(&mut self, f: F) -> Result<T, ExecutionError>;
+    fn spawn(&self, f: F) -> Result<(), ExecutionError>;
 }
 
-impl FuturesPool for ThreadPool {
-    fn block_on<R: Send + 'static, F: Future<Output = R> + Send + Unpin + 'static>(&mut self, f: F) -> Result<R, ExecutionError> {
-        let (tx, rx) = channel::bounded(1);
+impl<T, F> FuturesPool<T, F> for ThreadPool
+    where
+        T: Send + 'static,
+        F: Future<Output = T> + Send + 'static,
+{
+    fn block_on(&mut self, f: F) -> Result<T, ExecutionError> {
+        Err(ExecutionError::Uninitialized)
+    }
 
-        let fut_wrapper = async move {
-            let res = f.await;
-            tx.send(res).expect("Failed to send the future's result");
+    fn spawn(&self, f: F) -> Result<(), ExecutionError> {
+        let future = async move {
+//            Task::get_current()
+            f.await
         };
 
-//        let local_fut = LocalFutureObj::new(Box::new(fut_wrapper));
-
-        self
-            .dispatch(Message::FutureJob(Box::pin(fut_wrapper)), 1, true)
-            .expect("Failed to dispatch the future to a worker ... ");
-
-        rx.recv().map_err(|_| {
-            ExecutionError::Disconnected
-        })
-    }
-
-    fn spawn<F: Future<Output = ()> + 'static>(&self, f: F) -> Result<(), ExecutionError> {
-//        self.dispatch(Message::FutureJob(Box::pin(f)), 1, true)
-//            .expect("Failed to dispatch the future to a worker");
-
-        if let Some(pool) = self.local_pool.as_ref() {
-            pool.1.spawn_local(f).expect("Failed to spawn the future ... ");
-//            pool.0.run_until_stalled();
-        }
-
         Ok(())
-    }
-
-    fn run(&mut self) {
-        if let Some(pool) = self.local_pool.as_mut() {
-            pool.0.run_until_stalled();
-        }
     }
 }
 

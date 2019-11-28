@@ -10,8 +10,6 @@ use crate::manager::{MaxIdle, StatusBehaviorDefinitions, StatusBehaviors};
 use crate::model::*;
 use crate::scheduler::PoolStatus;
 use crossbeam_channel as channel;
-use futures_executor::{LocalPool, LocalSpawner};
-use futures_util::task::LocalSpawnExt;
 use hashbrown::HashSet;
 use parking_lot::RwLock;
 
@@ -21,6 +19,7 @@ const LOT_COUNTS: usize = 3;
 const LONG_PARKING_ROUNDS: u8 = 8;
 const SHORT_PARKING_ROUNDS: u8 = 2;
 
+/*
 struct FutWorker {
     local_pool: LocalPool,
     tasks_queue: LocalSpawner,
@@ -62,6 +61,7 @@ impl FutWorker {
         self.tasks_counter == 0
     }
 }
+*/
 
 pub(crate) struct Worker {
     id: usize,
@@ -163,7 +163,7 @@ impl Worker {
                     _ => (false, false),
                 };
 
-                let mut fut_handler = None;
+//                let mut fut_handler = None;
 
                 // main worker loop
                 loop {
@@ -207,7 +207,7 @@ impl Worker {
                         Worker::handle_work(
                             work,
                             fut_work,
-                            &mut fut_handler,
+//                            &mut fut_handler,
                             &mut since
                         )
                         .or_else(|| {
@@ -373,13 +373,14 @@ impl Worker {
     fn handle_work(
         work: Option<Job>,
         fut_work: Option<FutJob>,
-        fut_handler: &mut Option<FutWorker>,
+//        fut_handler: &mut Option<FutWorker>,
         since: &mut Option<SystemTime>
     ) -> Option<Duration>
     {
         match (work, fut_work) {
             (Some(w), None) => w.call_box(),
             (None, Some(j)) => {
+                /*
                 if fut_handler.is_none() {
                     fut_handler.replace(FutWorker::new());
                 }
@@ -391,6 +392,7 @@ impl Worker {
 
                     handler.run();
                 }
+                */
             },
             _ => return None,
         }
