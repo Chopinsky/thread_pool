@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicUsize, Ordering}, Weak};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
@@ -63,9 +63,14 @@ impl FutWorker {
 }
 */
 
+thread_local!(
+
+);
+
 pub(crate) struct Worker {
     id: usize,
     thread: Option<thread::JoinHandle<()>>,
+    stat: Weak<AtomicUsize>,
     before_drop: Option<WorkerUpdate>,
     after_drop: Option<WorkerUpdate>,
 }
@@ -80,12 +85,12 @@ impl Worker {
         stack_size: usize,
         privileged: bool,
         rx_pair: (channel::Receiver<Message>, channel::Receiver<Message>),
-        shared_info: (Arc<RwLock<HashSet<usize>>>, PoolStatus, MaxIdle), // (graveyard, max_idle, pool_status)
+        shared_info: (PoolStatus, MaxIdle), // (max_idle, pool_status)
         behavior_definition: &StatusBehaviors,
     ) -> Worker {
         behavior_definition.before_start(my_id);
 
-        let worker: thread::JoinHandle<()> =
+        let (worker, stat) =
             Self::spawn_worker(name, my_id, stack_size, privileged, rx_pair, shared_info);
 
         behavior_definition.after_start(my_id);
@@ -93,6 +98,7 @@ impl Worker {
         Worker {
             id: my_id,
             thread: Some(worker),
+            stat,
             before_drop: behavior_definition.before_drop_clone(),
             after_drop: behavior_definition.after_drop_clone(),
         }
@@ -107,6 +113,10 @@ impl Worker {
     /// up from hibernation. This could block the caller for an undetermined amount of time.
     pub(crate) fn retire(&mut self) {
         if let Some(handle) = self.thread.take() {
+            if let Some(stat) = self.stat.upgrade() {
+                stat.store(1, Ordering::SeqCst);
+            }
+
             // make sure we can wake up and quit
             handle.thread().unpark();
 
@@ -131,8 +141,8 @@ impl Worker {
         stack_size: usize,
         privileged: bool,
         rx_pair: (channel::Receiver<Message>, channel::Receiver<Message>),
-        shared_info: (Arc<RwLock<HashSet<usize>>>, PoolStatus, MaxIdle),
-    ) -> thread::JoinHandle<()> {
+        shared_info: (PoolStatus, MaxIdle),
+    ) -> (thread::JoinHandle<()>, Weak<AtomicUsize>) {
         let mut builder = thread::Builder::new();
 
         if name.is_some() {
@@ -143,7 +153,10 @@ impl Worker {
             builder = builder.stack_size(stack_size);
         }
 
-        builder
+        let worker_stat = Arc::new(AtomicUsize::new(0));
+        let stat_clone = Arc::downgrade(&worker_stat);
+
+        let handle = builder
             .spawn(move || {
                 let mut done: bool;
                 let mut status: u8;
@@ -156,23 +169,18 @@ impl Worker {
                 };
 
                 // unpack the shared info triple
-                let (graveyard, pool_status, max_idle) = shared_info;
+                let (pool_status, max_idle) = shared_info;
                 let (pri_wait, norm_wait) = match my_id % LOT_COUNTS {
                     0 => (true, false),
                     1 => (false, true),
                     _ => (false, false),
                 };
 
-//                let mut fut_handler = None;
-
                 // main worker loop
                 loop {
                     // get ready to take new work from the channel
-                    {
-                        if graveyard.read().contains(&my_id) {
-                            // async universal kill, or a targeted kill, either way, we shall quit
-                            return;
-                        }
+                    if worker_stat.load(Ordering::SeqCst) == 1usize {
+                        return;
                     }
 
                     // get the pool status code
@@ -207,7 +215,6 @@ impl Worker {
                         Worker::handle_work(
                             work,
                             fut_work,
-//                            &mut fut_handler,
                             &mut since
                         )
                         .or_else(|| {
@@ -219,7 +226,7 @@ impl Worker {
                             // then we're done now -- self-purging.
                             if max_idle.expired(&idle.as_millis()) {
                                 // mark self as a voluntary retiree
-                                graveyard.write().insert(my_id);
+                                worker_stat.store(1, Ordering::SeqCst);
                                 return Some(());
                             }
 
@@ -228,33 +235,33 @@ impl Worker {
                         .is_some();
 
                     // if not done and it's a target kill, handle it now
-                    done = done
-                        || target
-                            .and_then(|id_slice| {
-                                if id_slice.is_empty() {
-                                    return None;
-                                }
-
-                                // write and done, keep the write lock scoped and update the graveyard
-                                let mut found = false;
-                                let mut g = graveyard.write();
-
-                                for id in id_slice {
-                                    // update graveyard for clean up purposes
-                                    g.insert(id);
-
-                                    // only receiving the universal kill-signal from closing the channel
-                                    found = found || id == my_id;
-                                }
-
-                                // if my id or a forced kill, just quit
-                                if found {
-                                    return Some(());
-                                }
-
-                                None
-                            })
-                            .is_some();
+//                    done = done
+//                        || target
+//                            .and_then(|id_slice| {
+//                                if id_slice.is_empty() {
+//                                    return None;
+//                                }
+//
+//                                // write and done, keep the write lock scoped and update the graveyard
+//                                let mut found = false;
+//                                let mut g = graveyard.write();
+//
+//                                for id in id_slice {
+//                                    // update graveyard for clean up purposes
+//                                    g.insert(id);
+//
+//                                    // only receiving the universal kill-signal from closing the channel
+//                                    found = found || id == my_id;
+//                                }
+//
+//                                // if my id or a forced kill, just quit
+//                                if found {
+//                                    return Some(());
+//                                }
+//
+//                                None
+//                            })
+//                            .is_some();
 
                     if done {
                         return;
@@ -265,7 +272,9 @@ impl Worker {
                     }
                 }
             })
-            .unwrap()
+            .unwrap();
+
+        (handle, stat_clone)
     }
 
     fn check_queues(

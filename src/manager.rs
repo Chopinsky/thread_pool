@@ -25,7 +25,6 @@ pub(crate) struct Manager {
     mutating: AtomicI8,
     last_worker_id: usize,
     max_idle: MaxIdle,
-    graveyard: Arc<RwLock<HashSet<usize>>>,
     chan: (Receiver<Message>, Receiver<Message>),
 }
 
@@ -47,13 +46,11 @@ impl Manager {
             mutating: AtomicI8::new(0),
             last_worker_id: INIT_ID,
             max_idle,
-            graveyard: Arc::new(RwLock::new(HashSet::new())),
             chan: (pri_rx, rx),
         };
 
         if !lazy_built {
             m.add_workers(range, true, status);
-            m.graveyard.write().reserve(range);
 
             if is_debug_mode() {
                 println!("Pool has been initialized with {} pools", m.workers.len());
@@ -98,7 +95,7 @@ impl Manager {
         self.reset_lock();
 
         // also clear the graveyard
-        self.graveyard.write().clear();
+        self.worker_cleanup();
         self.last_worker_id = INIT_ID;
     }
 
@@ -109,7 +106,7 @@ impl Manager {
 
         if self.last_worker_id > INIT_ID {
             // before adding new workers, remove killed ones.
-            self.graveyard_cleanup();
+            self.worker_cleanup();
         }
 
         // if someone is actively adding workers, we skip this op
@@ -142,7 +139,6 @@ impl Manager {
                 privileged,
                 (pri_rx, rx),
                 (
-                    Arc::clone(&self.graveyard),
                     status.clone(),
                     self.max_idle.clone(),
                 ),
@@ -157,45 +153,15 @@ impl Manager {
     pub(crate) fn wake_up(&mut self, closing: bool) {
         if !closing {
             // take the chance to clean up the graveyard
-            self.graveyard_cleanup();
+            self.worker_cleanup();
         }
 
         // call everyone to wake up and work
         self.workers.iter().for_each(|worker| worker.wake_up());
     }
 
-    fn graveyard_cleanup(&mut self) {
-        let g = {
-            let mut g = self.graveyard.write();
-
-            if g.is_empty() {
-                return;
-            }
-
-            g.drain().collect::<HashSet<usize>>()
-        };
-
-        let mut last = self.workers.len();
-        let mut index = 0;
-
-        // make sure we've exclusive lock before modifying the workers vec
-        self.spin_update(-1);
-
-        // updating the workers vec
-        while index < last {
-            if g.contains(&self.workers[index].get_id()) {
-                last -= 1;
-                if self.workers.swap_remove(index).get_id() == self.last_worker_id {
-                    // update the last worker id, since the last one has been released
-                    self.last_worker_id -= 1;
-                }
-            }
-
-            index += 1;
-        }
-
-        // return the lock back
-        self.reset_lock();
+    fn worker_cleanup(&mut self) {
+        //TODO: pop up all workers with stat == 1 (retired)
     }
 }
 
@@ -241,7 +207,6 @@ impl WorkerManagement for Manager {
             return Vec::new();
         }
 
-        let mut g = self.graveyard.write();
         let start = self.workers.len() - less;
 
         // make sure we've exclusive lock before modifying the workers vec
@@ -252,10 +217,10 @@ impl WorkerManagement for Manager {
         let workers = self
             .workers
             .drain(start..)
-            .map(|w| {
+            .map(|mut w| {
                 let id = w.get_id();
                 w.wake_up();
-                g.insert(id);
+                w.retire();
                 id
             })
             .collect();
@@ -275,15 +240,15 @@ impl WorkerManagement for Manager {
 
                 // get the lock, swap out the worker, use swap_remove for better performance.
                 self.spin_update(-1);
-                res.replace(self.workers.swap_remove(idx).get_id());
+                let mut retired = self.workers.swap_remove(idx);
                 self.reset_lock();
+
+                // now update the return value and notify worker to dismiss
+                res.replace(retired.get_id());
+                retired.retire();
 
                 break;
             }
-        }
-
-        if res.is_some() {
-            self.graveyard.write().insert(id);
         }
 
         res
