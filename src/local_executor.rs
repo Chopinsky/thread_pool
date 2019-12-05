@@ -3,7 +3,6 @@
 use std::pin::Pin;
 use std::sync::Arc;
 use std::thread::{self, Thread};
-use crate::model::FutJob;
 
 thread_local! {
 //    static NOTIFIER: Arc<ThreadNotifier> = Arc::new(ThreadNotifier {

@@ -10,9 +10,9 @@ use crate::config::{Config, ConfigStatus, TimeoutPolicy};
 use crate::debug::is_debug_mode;
 use crate::manager::*;
 use crate::model::*;
-use channel::{SendError, SendTimeoutError, Sender, TrySendError, TryRecvError};
-use crossbeam_channel as channel;
 use async_task::Task;
+use channel::{SendError, SendTimeoutError, Sender, TryRecvError, TrySendError};
+use crossbeam_channel as channel;
 
 const RETRY_LIMIT: u8 = 4;
 const CHAN_CAP: usize = 16;
@@ -493,8 +493,8 @@ impl ThreadPool {
 
         let manager = Manager::build(config, pool_size, flag.clone(), pri_rx, rx, lazy_built);
 
-//        let pool = LocalPool::new();
-//        let spawner = pool.spawner();
+        //        let pool = LocalPool::new();
+        //        let spawner = pool.spawner();
 
         ThreadPool {
             manager,
@@ -507,7 +507,7 @@ impl ThreadPool {
             non_blocking,
             queue_timeout: None,
             timeout_policy: policy,
-//            local_pool: Some((pool, spawner)),
+            //            local_pool: Some((pool, spawner)),
         }
     }
 }
@@ -798,18 +798,18 @@ impl PoolState for ThreadPool {
 }
 
 pub trait FuturesPool<T, F>
-    where
-        T: Send + 'static,
-        F: Future<Output = T> + Send + 'static,
+where
+    T: Send + 'static,
+    F: Future<Output = T> + Send + 'static,
 {
     fn block_on(&mut self, f: F) -> Result<T, ExecutionError>;
     fn spawn(&self, f: F) -> Result<(), ExecutionError>;
 }
 
 impl<T, F> FuturesPool<T, F> for ThreadPool
-    where
-        T: Send + 'static,
-        F: Future<Output = T> + Send + 'static,
+where
+    T: Send + 'static,
+    F: Future<Output = T> + Send + 'static,
 {
     fn block_on(&mut self, f: F) -> Result<T, ExecutionError> {
         Err(ExecutionError::Uninitialized)
@@ -817,7 +817,7 @@ impl<T, F> FuturesPool<T, F> for ThreadPool
 
     fn spawn(&self, f: F) -> Result<(), ExecutionError> {
         let future = async move {
-//            Task::get_current()
+            //            Task::get_current()
             f.await
         };
 

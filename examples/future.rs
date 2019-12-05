@@ -1,9 +1,9 @@
 extern crate threads_pool;
 
-use threads_pool::prelude::*;
 use futures_channel::mpsc;
-use futures_util::StreamExt;
 use futures_executor::block_on;
+use futures_util::StreamExt;
+use threads_pool::prelude::*;
 
 fn main() {
     let size = 4;
@@ -26,7 +26,7 @@ fn main() {
         while let Some(v) = rx.next().await {
             println!("Receiving ...");
             pending.push(v * 2);
-        };
+        }
 
         println!("{}", pending.len());
     };

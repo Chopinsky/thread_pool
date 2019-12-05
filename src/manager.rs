@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 use std::ptr::{self, NonNull};
-use std::sync::{atomic::AtomicI8, Arc};
+use std::sync::atomic::AtomicI8;
 
 use crate::config::{Config, ConfigStatus};
 use crate::debug::is_debug_mode;
@@ -10,8 +10,6 @@ use crate::model::{
 use crate::scheduler::PoolStatus;
 use crate::worker::Worker;
 use crossbeam_channel::Receiver;
-use hashbrown::HashSet;
-use parking_lot::RwLock;
 
 /// The first id that can be taken by workers. All previous ones are reserved for future use in the
 /// graveyard. Note that the `INIT_ID` is still the one reserved, and manager's first valid
@@ -95,7 +93,6 @@ impl Manager {
         self.reset_lock();
 
         // also clear the graveyard
-        self.worker_cleanup();
         self.last_worker_id = INIT_ID;
     }
 
@@ -138,10 +135,7 @@ impl Manager {
                 stack_size,
                 privileged,
                 (pri_rx, rx),
-                (
-                    status.clone(),
-                    self.max_idle.clone(),
-                ),
+                (status.clone(), self.max_idle.clone()),
                 self.config.worker_behavior(),
             ));
         });
@@ -161,7 +155,19 @@ impl Manager {
     }
 
     fn worker_cleanup(&mut self) {
-        //TODO: pop up all workers with stat == 1 (retired)
+        let (mut pos, mut end) = (0usize, self.workers.len());
+        while pos < end {
+            let worker: &mut Worker = &mut self.workers[pos];
+            let done = worker.is_terminated();
+
+            if done {
+                worker.retire();
+                self.workers.swap_remove(pos);
+                end -= 1;
+            } else {
+                pos += 1;
+            }
+        }
     }
 }
 

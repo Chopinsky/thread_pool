@@ -1,7 +1,10 @@
 #![allow(dead_code)]
 
 use std::future::Future;
-use std::sync::{Arc, atomic::{AtomicUsize, Ordering}, Weak};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Weak,
+};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
@@ -10,8 +13,6 @@ use crate::manager::{MaxIdle, StatusBehaviorDefinitions, StatusBehaviors};
 use crate::model::*;
 use crate::scheduler::PoolStatus;
 use crossbeam_channel as channel;
-use hashbrown::HashSet;
-use parking_lot::RwLock;
 
 const TIMEOUT: Duration = Duration::from_micros(16);
 const LONG_TIMEOUT: Duration = Duration::from_micros(96);
@@ -63,9 +64,7 @@ impl FutWorker {
 }
 */
 
-thread_local!(
-
-);
+thread_local!();
 
 pub(crate) struct Worker {
     id: usize,
@@ -75,7 +74,7 @@ pub(crate) struct Worker {
     after_drop: Option<WorkerUpdate>,
 }
 
-struct WorkStatus(i8, Option<Job>, Option<FutJob>, Option<Vec<usize>>);
+struct WorkStatus(i8, Option<Job>);
 
 impl Worker {
     /// Create and spawn the worker, this will dispatch the worker to listen to work queue immediately
@@ -135,6 +134,15 @@ impl Worker {
         }
     }
 
+    /// Check if the worker has quit its inner loop and ready to be joined
+    pub(crate) fn is_terminated(&self) -> bool {
+        if let Some(stat) = self.stat.upgrade() {
+            return stat.load(Ordering::Acquire) == 1usize;
+        }
+
+        false
+    }
+
     fn spawn_worker(
         name: Option<String>,
         my_id: usize,
@@ -192,11 +200,12 @@ impl Worker {
                     {
                         // if shutting down, check if we can abandon all work by checking forced
                         // close flag, or when all work have been processed.
+                        worker_stat.store(1, Ordering::SeqCst);
                         return;
                     }
 
                     // wait for work loop
-                    let (work, fut_work, target) = match Worker::check_queues(
+                    let work = match Worker::check_queues(
                         &rx_pair.0,
                         &rx_pair.1,
                         pri_wait,
@@ -204,9 +213,11 @@ impl Worker {
                         &mut pri_work_count,
                     ) {
                         // if the channels are disconnected, return
-                        WorkStatus(-1, _, _, _) => return,
-                        WorkStatus(_, job, fut_job, target) =>
-                            (job, fut_job, target),
+                        WorkStatus(-1, _) => {
+                            worker_stat.store(1, Ordering::SeqCst);
+                            return;
+                        }
+                        WorkStatus(_, job) => job,
                     };
 
                     // if there's a job, get it done first, and calc the idle period since last actual job
@@ -214,7 +225,6 @@ impl Worker {
                         // if we have work, do them now
                         Worker::handle_work(
                             work,
-                            fut_work,
                             &mut since
                         )
                         .or_else(|| {
@@ -235,33 +245,33 @@ impl Worker {
                         .is_some();
 
                     // if not done and it's a target kill, handle it now
-//                    done = done
-//                        || target
-//                            .and_then(|id_slice| {
-//                                if id_slice.is_empty() {
-//                                    return None;
-//                                }
-//
-//                                // write and done, keep the write lock scoped and update the graveyard
-//                                let mut found = false;
-//                                let mut g = graveyard.write();
-//
-//                                for id in id_slice {
-//                                    // update graveyard for clean up purposes
-//                                    g.insert(id);
-//
-//                                    // only receiving the universal kill-signal from closing the channel
-//                                    found = found || id == my_id;
-//                                }
-//
-//                                // if my id or a forced kill, just quit
-//                                if found {
-//                                    return Some(());
-//                                }
-//
-//                                None
-//                            })
-//                            .is_some();
+                    //                    done = done
+                    //                        || target
+                    //                            .and_then(|id_slice| {
+                    //                                if id_slice.is_empty() {
+                    //                                    return None;
+                    //                                }
+                    //
+                    //                                // write and done, keep the write lock scoped and update the graveyard
+                    //                                let mut found = false;
+                    //                                let mut g = graveyard.write();
+                    //
+                    //                                for id in id_slice {
+                    //                                    // update graveyard for clean up purposes
+                    //                                    g.insert(id);
+                    //
+                    //                                    // only receiving the universal kill-signal from closing the channel
+                    //                                    found = found || id == my_id;
+                    //                                }
+                    //
+                    //                                // if my id or a forced kill, just quit
+                    //                                if found {
+                    //                                    return Some(());
+                    //                                }
+                    //
+                    //                                None
+                    //                            })
+                    //                            .is_some();
 
                     if done {
                         return;
@@ -294,8 +304,7 @@ impl Worker {
             match Worker::fetch_work(pri_chan, norm_full && !pri_wait) {
                 Ok(message) => {
                     // message is the only place that can update the "done" field
-                    let (job, fut_job, target)
-                        = Worker::unpack_message(message);
+                    let (job, _) = Worker::unpack_message(message);
 
                     if *pri_work_count < 4 {
                         // only add if we're below the continuous pri-work cap
@@ -307,11 +316,11 @@ impl Worker {
                         *pri_work_count = 255;
                     }
 
-                    return WorkStatus(0, job, fut_job, target);
+                    return WorkStatus(0, job);
                 }
                 Err(channel::RecvTimeoutError::Disconnected) => {
                     // sender has been dropped
-                    return WorkStatus(-1, None, None, None);
+                    return WorkStatus(-1, None);
                 }
                 Err(channel::RecvTimeoutError::Timeout) => {
                     // if chan empty, do nothing and fall through to the normal chan handle
@@ -329,21 +338,21 @@ impl Worker {
         match Worker::fetch_work(norm_chan, pri_chan.is_full() && !norm_wait) {
             Ok(message) => {
                 // message is the only place that can update the "done" field
-                let (job, fut_job, target) = Worker::unpack_message(message);
+                let (job, _) = Worker::unpack_message(message);
                 *pri_work_count = 0;
 
-                return WorkStatus(0, job, fut_job, target);
+                return WorkStatus(0, job);
             }
             Err(channel::RecvTimeoutError::Disconnected) => {
                 // sender has been dropped
-                return WorkStatus(-1, None, None, None);
+                return WorkStatus(-1, None);
             }
             Err(channel::RecvTimeoutError::Timeout) => {
                 // nothing to receive yet
             }
         };
 
-        WorkStatus(0, None, None, None)
+        WorkStatus(0, None)
     }
 
     fn fetch_work(
@@ -379,31 +388,9 @@ impl Worker {
         }
     }
 
-    fn handle_work(
-        work: Option<Job>,
-        fut_work: Option<FutJob>,
-//        fut_handler: &mut Option<FutWorker>,
-        since: &mut Option<SystemTime>
-    ) -> Option<Duration>
-    {
-        match (work, fut_work) {
-            (Some(w), None) => w.call_box(),
-            (None, Some(j)) => {
-                /*
-                if fut_handler.is_none() {
-                    fut_handler.replace(FutWorker::new());
-                }
-
-                if let Some(handler) = fut_handler {
-                    handler
-                        .push(j)
-                        .expect("Failed to spawn  the future ... ");
-
-                    handler.run();
-                }
-                */
-            },
-            _ => return None,
+    fn handle_work(work: Option<Job>, since: &mut Option<SystemTime>) -> Option<Duration> {
+        if let Some(w) = work {
+            w.call_box();
         }
 
         let mut idle = None;
@@ -415,13 +402,10 @@ impl Worker {
         idle
     }
 
-    fn unpack_message(message: Message) -> (Option<Job>, Option<FutJob>, Option<Vec<usize>>) {
+    fn unpack_message(message: Message) -> (Option<Job>, Option<Vec<usize>>) {
         match message {
-            Message::ThroughJob(job) => (Some(job), None, None),
-            Message::FutureJob(fut_job) => {
-                (None, Some(fut_job), None)
-            }
-            Message::Terminate(target) => (None, None, Some(target)),
+            Message::ThroughJob(job) => (Some(job), None),
+            Message::Terminate(target) => (None, Some(target)),
         }
     }
 

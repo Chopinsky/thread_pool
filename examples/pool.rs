@@ -38,7 +38,7 @@ fn main() {
     println!("All jobs are sent, now blocking on ...");
 
     let result = pool
-        .block_on(|| {
+        .sync_block(|| {
             let mut sum = 0;
             for i in 0..100 {
                 sum += i * i;
