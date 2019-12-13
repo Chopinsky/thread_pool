@@ -1,5 +1,4 @@
 use std::future::Future;
-//use std::mem;
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::thread;
@@ -10,7 +9,6 @@ use crate::config::{Config, ConfigStatus, TimeoutPolicy};
 use crate::debug::is_debug_mode;
 use crate::manager::*;
 use crate::model::*;
-use async_task::Task;
 use channel::{SendError, SendTimeoutError, Sender, TryRecvError, TrySendError};
 use crossbeam_channel as channel;
 
@@ -44,12 +42,13 @@ pub enum ExecutionError {
 ///
 /// ```
 /// extern crate threads_pool;
-/// use threads_pool::ThreadPool;
+///
+/// use threads_pool as pool;
 /// use std::thread;
 /// use std::time::Duration;
 ///
 /// // lazy-create the pool
-/// let mut pool = ThreadPool::new(4);
+/// let mut pool = pool::ThreadPool::build(4);
 ///
 /// // get ready to submit parallel jobs, first of all, activate the pool. Not that this step is
 /// // optional if the caller will only use the `exec` API to submit jobs.
@@ -156,12 +155,12 @@ impl ThreadPool {
     ///
     /// ```
     /// extern crate threads_pool;
-    /// use threads_pool::ThreadPool;
     /// use std::thread;
     /// use std::time::Duration;
+    /// use threads_pool as pool;
     ///
     /// // lazy-create the pool
-    /// let mut pool = ThreadPool::build(4);
+    /// let mut pool = pool::ThreadPool::build(4);
     ///
     /// // work on other stuff ...
     /// thread::sleep(Duration::from_secs(4));
@@ -261,11 +260,11 @@ impl ThreadPool {
     ///
     /// ```
     /// extern crate threads_pool;
-    /// use threads_pool::ThreadPool;
+    /// use threads_pool as pool;
     /// use std::thread;
     /// use std::time::Duration;
     ///
-    /// let mut pool = ThreadPool::new(4);
+    /// let mut pool = pool::ThreadPool::build(4);
     ///
     /// for id in 0..10 {
     ///     pool.exec(|| {
@@ -301,7 +300,7 @@ impl ThreadPool {
         let retry = if self.auto_scale { 1 } else { 0 };
 
         // send the job for execution
-        self.dispatch(Message::ThroughJob(Box::new(f)), retry, prioritized)
+        self.dispatch(Message::SingleJob(Box::new(f)), retry, prioritized)
             .map(|busy| {
                 if busy && self.auto_scale {
                     // auto scale by adding more workers to take the job
@@ -330,11 +329,11 @@ impl ThreadPool {
     ///
     /// ```
     /// extern crate threads_pool;
-    /// use threads_pool::ThreadPool;
+    /// use threads_pool as pool;
     /// use std::thread;
     /// use std::time::Duration;
     ///
-    /// let pool = ThreadPool::new(4);
+    /// let pool = pool::ThreadPool::build(4);
     ///
     /// for id in 0..10 {
     ///     pool.execute(|| {
@@ -357,7 +356,8 @@ impl ThreadPool {
         // send the job to the queue for execution. note that if we're in hibernation, the queue
         // will still take the new job, though no worker will be awaken to take the job.
         let prioritized = self.chan.1.is_empty() && !self.chan.0.is_full();
-        self.dispatch(Message::ThroughJob(Box::new(f)), 0, prioritized)
+
+        self.dispatch(Message::SingleJob(Box::new(f)), 0, prioritized)
             .map(|_| {})
             .map_err(|err| match err {
                 SendTimeoutError::Timeout(_) => ExecutionError::Timeout,
@@ -365,17 +365,22 @@ impl ThreadPool {
             })
     }
 
-    pub fn sync_block<R: Send + 'static, F: FnOnce() -> R + Send + 'static>(
-        &self,
-        f: F,
-    ) -> Result<R, ExecutionError> {
+    pub fn sync_block<R, F>(&self, f: F) -> Result<R, ExecutionError>
+    where
+        R: Send + 'static,
+        F: FnOnce() -> R + Send + 'static,
+    {
         let curr = thread::current();
         let (tx, rx) = channel::bounded(1);
 
-        thread::spawn(move || {
+        let clo = Box::new(move || {
             tx.send(f()).unwrap_or_default();
             curr.unpark();
         });
+
+        if self.dispatch(Message::SingleJob(clo), 4, false).is_err() {
+            return Err(ExecutionError::Timeout);
+        }
 
         // timeout after 8 seconds of no responses ...
         thread::park_timeout(Duration::from_secs(8));
@@ -543,8 +548,9 @@ impl Hibernation for ThreadPool {
     fn unhibernate(&mut self) {
         // only wake everyone up if we're in the right status
         if self.update_status(FLAG_HIBERNATING, FLAG_NORMAL) {
-            // wake up everybody, the API will take the chance to clean up the graveyard
-            self.manager.wake_up(false);
+            // take the chance to clean up the graveyard
+            self.manager.worker_cleanup();
+            self.wake_workers();
         }
     }
 
@@ -843,6 +849,8 @@ trait DispatchFlavors {
         chan: (&Sender<Message>, u8),
         message: Message,
     ) -> Result<(), SendTimeoutError<Message>>;
+
+    fn wake_workers(&self);
 }
 
 impl DispatchFlavors for ThreadPool {
@@ -863,7 +871,11 @@ impl DispatchFlavors for ThreadPool {
                     return Err(SendTimeoutError::Disconnected(msg))
                 }
                 Err(SendTimeoutError::Timeout(msg)) => {
+                    // put the message back in pristine state
                     retry_message = msg;
+
+                    // try bring any sleeping workers online now
+                    self.wake_workers();
 
                     // if we use a lossy channel, always try to drop messages and try sending
                     // again, even if it means we need to clear the channel (i.e. too many
@@ -879,7 +891,7 @@ impl DispatchFlavors for ThreadPool {
                         TimeoutPolicy::DirectRun => {
                             // directly run the job; the termination message will not be
                             // sent in this workflow, so we shall not worry about that.
-                            if let Message::ThroughJob(job) = retry_message {
+                            if let Message::SingleJob(job) = retry_message {
                                 job.call_box();
                             }
 
@@ -922,6 +934,9 @@ impl DispatchFlavors for ThreadPool {
             Ok(()) => Ok(()),
             Err(TrySendError::Disconnected(msg)) => Err(SendTimeoutError::Disconnected(msg)),
             Err(TrySendError::Full(msg)) => {
+                // bring any offline workers back online first
+                self.wake_workers();
+
                 if let TimeoutPolicy::LossyRetry = self.timeout_policy {
                     // drop a message and try again, just once
                     self.manager.drop_one(chan.1);
@@ -936,6 +951,14 @@ impl DispatchFlavors for ThreadPool {
                     Err(SendTimeoutError::Timeout(msg))
                 }
             }
+        }
+    }
+
+    fn wake_workers(&self) {
+        if self.status.has_hibernate_workers() {
+            // wake up workers now
+            self.manager.wake_up();
+            self.status.toggle_flag(FLAG_SLEEP_WORKERS, false);
         }
     }
 }
@@ -973,9 +996,32 @@ impl PoolStatus {
 
     fn closing(&self) -> bool {
         unsafe {
-            // FLAG_CLOSING | FLAG_FORCE_CLOSE == 3
-            self.0.as_ref().fetch_and(3, Ordering::Acquire) > 0
+            // FLAG_CLOSING = 1, FLAG_FORCE_CLOSE == 2
+            self.0
+                .as_ref()
+                .fetch_and(FLAG_CLOSING | FLAG_FORCE_CLOSE, Ordering::Acquire)
+                > 0
         }
+    }
+
+    fn has_hibernate_workers(&self) -> bool {
+        unsafe {
+            // FLAG_HIBERNATING = 4, FLAG_SLEEP_WORKERS = 32
+            self.0
+                .as_ref()
+                .fetch_and(FLAG_HIBERNATING | FLAG_SLEEP_WORKERS, Ordering::Acquire)
+                > 0
+        }
+    }
+
+    fn calc_new_stat(&self, old: u8, flag: u8, toggle_on: bool) -> Result<u8, ()> {
+        if (toggle_on && (old & flag) > 0) || (!toggle_on && (old & flag) == 0) {
+            // we already have the desired flag
+            return Err(());
+        }
+
+        // get the new state
+        Ok(if toggle_on { old | flag } else { old ^ flag })
     }
 
     fn compare_exchange(&self, old: u8, new: u8) -> bool {
@@ -996,6 +1042,35 @@ impl PoolStatus {
     #[inline]
     pub(crate) fn load(&self) -> u8 {
         unsafe { self.0.as_ref().load(Ordering::Acquire) }
+    }
+
+    pub(crate) fn toggle_flag(&self, flag: u8, toggle_on: bool) {
+        assert!(flag % 2 == 0 || flag == 1, "forbidden to set multiple flags at the same time");
+
+        unsafe {
+            let mut old: u8 = self.0.as_ref().load(Ordering::Acquire);
+            let mut new: u8;
+
+            if let Ok(val) = self.calc_new_stat(old, flag, toggle_on) {
+                new = val;
+            } else {
+                return;
+            }
+
+            while let Err(curr) =
+            self.0
+                .as_ref()
+                .compare_exchange_weak(old, new, Ordering::SeqCst, Ordering::Relaxed)
+                {
+                    old = curr;
+
+                    if let Ok(val) = self.calc_new_stat(old, flag, toggle_on) {
+                        new = val;
+                    } else {
+                        return;
+                    }
+                }
+        }
     }
 }
 

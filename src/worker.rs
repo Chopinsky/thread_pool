@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::future::Future;
+//use std::future::Future;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Weak,
@@ -9,7 +9,7 @@ use std::thread;
 use std::time::{Duration, SystemTime};
 
 use crate::debug::is_debug_mode;
-use crate::manager::{MaxIdle, StatusBehaviorDefinitions, StatusBehaviors};
+use crate::manager::{IdleThreshold, StatusBehaviorDefinitions, StatusBehaviors};
 use crate::model::*;
 use crate::scheduler::PoolStatus;
 use crossbeam_channel as channel;
@@ -84,7 +84,7 @@ impl Worker {
         stack_size: usize,
         privileged: bool,
         rx_pair: (channel::Receiver<Message>, channel::Receiver<Message>),
-        shared_info: (PoolStatus, MaxIdle), // (max_idle, pool_status)
+        shared_info: (PoolStatus, IdleThreshold), // (idle_threshold, pool_status)
         behavior_definition: &StatusBehaviors,
     ) -> Worker {
         behavior_definition.before_start(my_id);
@@ -137,7 +137,7 @@ impl Worker {
     /// Check if the worker has quit its inner loop and ready to be joined
     pub(crate) fn is_terminated(&self) -> bool {
         if let Some(stat) = self.stat.upgrade() {
-            return stat.load(Ordering::Acquire) == 1usize;
+            return stat.load(Ordering::Acquire) == 2usize;
         }
 
         false
@@ -149,7 +149,7 @@ impl Worker {
         stack_size: usize,
         privileged: bool,
         rx_pair: (channel::Receiver<Message>, channel::Receiver<Message>),
-        shared_info: (PoolStatus, MaxIdle),
+        shared_info: (PoolStatus, IdleThreshold),
     ) -> (thread::JoinHandle<()>, Weak<AtomicUsize>) {
         let mut builder = thread::Builder::new();
 
@@ -166,7 +166,7 @@ impl Worker {
 
         let handle = builder
             .spawn(move || {
-                let mut done: bool;
+                let mut idle_stat: Option<u8>;
                 let mut status: u8;
                 let mut pri_work_count: u8 = 0;
 
@@ -177,7 +177,7 @@ impl Worker {
                 };
 
                 // unpack the shared info triple
-                let (pool_status, max_idle) = shared_info;
+                let (pool_status, idle_threshold) = shared_info;
                 let (pri_wait, norm_wait) = match my_id % LOT_COUNTS {
                     0 => (true, false),
                     1 => (false, true),
@@ -221,7 +221,7 @@ impl Worker {
                     };
 
                     // if there's a job, get it done first, and calc the idle period since last actual job
-                    done =
+                    idle_stat =
                         // if we have work, do them now
                         Worker::handle_work(
                             work,
@@ -234,47 +234,55 @@ impl Worker {
                         .and_then(|idle| {
                             // if idled longer than the expected worker life for unprivileged workers,
                             // then we're done now -- self-purging.
-                            if max_idle.expired(&idle.as_millis()) {
+                            let stat_code = idle_threshold.idle_stat(idle.as_secs() as u64);
+
+                            if stat_code > 0 {
                                 // mark self as a voluntary retiree
-                                worker_stat.store(1, Ordering::SeqCst);
-                                return Some(());
+                                worker_stat.store(stat_code as usize, Ordering::SeqCst);
+                                return Some(stat_code);
                             }
 
                             None
-                        })
-                        .is_some();
+                        });
 
+                    /*
                     // if not done and it's a target kill, handle it now
-                    //                    done = done
-                    //                        || target
-                    //                            .and_then(|id_slice| {
-                    //                                if id_slice.is_empty() {
-                    //                                    return None;
-                    //                                }
-                    //
-                    //                                // write and done, keep the write lock scoped and update the graveyard
-                    //                                let mut found = false;
-                    //                                let mut g = graveyard.write();
-                    //
-                    //                                for id in id_slice {
-                    //                                    // update graveyard for clean up purposes
-                    //                                    g.insert(id);
-                    //
-                    //                                    // only receiving the universal kill-signal from closing the channel
-                    //                                    found = found || id == my_id;
-                    //                                }
-                    //
-                    //                                // if my id or a forced kill, just quit
-                    //                                if found {
-                    //                                    return Some(());
-                    //                                }
-                    //
-                    //                                None
-                    //                            })
-                    //                            .is_some();
+                    done = done
+                        || target
+                            .and_then(|id_slice| {
+                                if id_slice.is_empty() {
+                                    return None;
+                                }
 
-                    if done {
-                        return;
+                                // write and done, keep the write lock scoped and update the graveyard
+                                let mut found = false;
+                                let mut g = graveyard.write();
+
+                                for id in id_slice {
+                                    // update graveyard for clean up purposes
+                                    g.insert(id);
+
+                                    // only receiving the universal kill-signal from closing the channel
+                                    found = found || id == my_id;
+                                }
+
+                                // if my id or a forced kill, just quit
+                                if found {
+                                    return Some(());
+                                }
+
+                                None
+                            })
+                            .is_some();
+                    */
+
+                    match idle_stat {
+                        Some(1) => {
+                            pool_status.toggle_flag(FLAG_SLEEP_WORKERS, true);
+                            thread::park();
+                        },
+                        Some(2) => return,
+                        _ => {}
                     }
 
                     if status == FLAG_HIBERNATING {
@@ -404,7 +412,8 @@ impl Worker {
 
     fn unpack_message(message: Message) -> (Option<Job>, Option<Vec<usize>>) {
         match message {
-            Message::ThroughJob(job) => (Some(job), None),
+            Message::SingleJob(job) => (Some(job), None),
+            Message::ChainedJobs(_) => unreachable!(),
             Message::Terminate(target) => (None, Some(target)),
         }
     }

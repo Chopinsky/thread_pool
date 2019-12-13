@@ -15,26 +15,25 @@ use std::time::Duration;
 // Constant flags
 pub(crate) const FLAG_NORMAL: u8 = 0;
 pub(crate) const FLAG_CLOSING: u8 = 1;
-pub(crate) const FLAG_FORCE_CLOSE: u8 = 2;
-pub(crate) const FLAG_HIBERNATING: u8 = 4;
-pub(crate) const FLAG_LAZY_INIT: u8 = 8;
-pub(crate) const FLAG_REST: u8 = 16;
-pub(crate) const EXPIRE_PERIOD: usize = 64;
+pub(crate) const FLAG_FORCE_CLOSE: u8 = 1 << 1;
+pub(crate) const FLAG_HIBERNATING: u8 = 1 << 2;
+pub(crate) const FLAG_LAZY_INIT: u8 = 1 << 3;
+pub(crate) const FLAG_REST: u8 = 1 << 4;
+pub(crate) const FLAG_SLEEP_WORKERS: u8 = 1 << 5;
+pub(crate) const EXPIRE_PERIOD: u64 = 128;
 
 const BACKOFF_RETRY_LIMIT: usize = 16;
 const ERR_MSG: &str = "Undefined behavior: the pool has been invoked without being initialized ...";
 
 // Enum ...
 pub(crate) enum Message {
-    ThroughJob(Job),
+    SingleJob(Job),
+    ChainedJobs(Vec<Job>),
     Terminate(Vec<usize>),
 }
 
 // Base types
 pub(crate) type Job = Box<dyn FnBox + Send + 'static>;
-//pub(crate) type FutJob = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
-//pub(crate) type FutJob = Box<LocalFutureObj<'static, ()>> + Send>;
-pub(crate) type BlockJob<R> = Box<dyn FnResBox<R> + Send + 'static>;
 pub(crate) type WorkerUpdate = fn(id: usize);
 
 // Traits

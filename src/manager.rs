@@ -1,6 +1,5 @@
 #![allow(dead_code)]
-use std::ptr::{self, NonNull};
-use std::sync::atomic::AtomicI8;
+use std::sync::atomic::{AtomicI8, AtomicU64, Ordering};
 
 use crate::config::{Config, ConfigStatus};
 use crate::debug::is_debug_mode;
@@ -10,6 +9,7 @@ use crate::model::{
 use crate::scheduler::PoolStatus;
 use crate::worker::Worker;
 use crossbeam_channel::Receiver;
+use std::sync::Arc;
 
 /// The first id that can be taken by workers. All previous ones are reserved for future use in the
 /// graveyard. Note that the `INIT_ID` is still the one reserved, and manager's first valid
@@ -22,7 +22,7 @@ pub(crate) struct Manager {
     workers: Vec<Worker>,
     mutating: AtomicI8,
     last_worker_id: usize,
-    max_idle: MaxIdle,
+    idle_threshold: IdleThreshold,
     chan: (Receiver<Message>, Receiver<Message>),
 }
 
@@ -35,15 +35,19 @@ impl Manager {
         rx: Receiver<Message>,
         lazy_built: bool,
     ) -> Manager {
-        let idle = Box::new(EXPIRE_PERIOD);
-        let max_idle = MaxIdle(unsafe { NonNull::new_unchecked(Box::into_raw(idle)) });
+        let idle_threshold = IdleThreshold {
+            inner: Arc::new((
+                AtomicU64::new(EXPIRE_PERIOD),
+                AtomicU64::new(4 * EXPIRE_PERIOD),
+            )),
+        };
 
         let mut m = Manager {
             config,
             workers: Vec::new(),
             mutating: AtomicI8::new(0),
             last_worker_id: INIT_ID,
-            max_idle,
+            idle_threshold,
             chan: (pri_rx, rx),
         };
 
@@ -135,7 +139,7 @@ impl Manager {
                 stack_size,
                 privileged,
                 (pri_rx, rx),
-                (status.clone(), self.max_idle.clone()),
+                (status.clone(), self.idle_threshold.clone()),
                 self.config.worker_behavior(),
             ));
         });
@@ -144,23 +148,17 @@ impl Manager {
         self.last_worker_id += count;
     }
 
-    pub(crate) fn wake_up(&mut self, closing: bool) {
-        if !closing {
-            // take the chance to clean up the graveyard
-            self.worker_cleanup();
-        }
-
+    pub(crate) fn wake_up(&self) {
         // call everyone to wake up and work
         self.workers.iter().for_each(|worker| worker.wake_up());
     }
 
-    fn worker_cleanup(&mut self) {
+    pub(crate) fn worker_cleanup(&mut self) {
         let (mut pos, mut end) = (0usize, self.workers.len());
         while pos < end {
             let worker: &mut Worker = &mut self.workers[pos];
-            let done = worker.is_terminated();
 
-            if done {
+            if worker.is_terminated() {
                 worker.retire();
                 self.workers.swap_remove(pos);
                 end -= 1;
@@ -171,19 +169,11 @@ impl Manager {
     }
 }
 
-impl Drop for Manager {
-    fn drop(&mut self) {
-        // now drop the manually allocated stuff
-        unsafe {
-            std::ptr::drop_in_place(self.max_idle.0.as_ptr());
-        }
-    }
-}
-
 #[doc(hidden)]
 pub(crate) trait WorkerManagement {
     fn workers_count(&self) -> usize;
-    fn worker_auto_expire(&mut self, life_in_millis: usize);
+    fn worker_auto_sleep(&mut self, life_in_ms: usize);
+    fn worker_auto_expire(&mut self, life_in_ms: usize);
     fn extend_by(&mut self, more: usize, status: PoolStatus);
     fn shrink_by(&mut self, less: usize) -> Vec<usize>;
     fn dismiss_worker(&mut self, id: usize) -> Option<usize>;
@@ -197,11 +187,18 @@ impl WorkerManagement for Manager {
         self.workers.len()
     }
 
-    fn worker_auto_expire(&mut self, life_in_millis: usize) {
-        unsafe {
-            let inner = self.max_idle.0.as_mut();
-            *inner = life_in_millis;
-        }
+    fn worker_auto_sleep(&mut self, life_in_ms: usize) {
+        self.idle_threshold
+            .inner
+            .0
+            .store(life_in_ms as u64, Ordering::SeqCst);
+    }
+
+    fn worker_auto_expire(&mut self, life_in_ms: usize) {
+        self.idle_threshold
+            .inner
+            .1
+            .store(life_in_ms as u64, Ordering::SeqCst);
     }
 
     fn extend_by(&mut self, more: usize, status: PoolStatus) {
@@ -455,28 +452,54 @@ impl Default for StatusBehaviors {
 }
 
 // Wrapper
-pub(crate) struct MaxIdle(NonNull<usize>);
-
-impl MaxIdle {
-    pub(crate) fn expired(&self, period: &u128) -> bool {
-        let max = unsafe { *self.0.as_ref() as u128 };
-        max.gt(&0) && max.le(period)
-    }
+pub(crate) struct IdleThreshold {
+    inner: Arc<(AtomicU64, AtomicU64)>,
 }
 
-impl Clone for MaxIdle {
-    fn clone(&self) -> Self {
-        MaxIdle(self.0)
-    }
-}
+impl IdleThreshold {
+    pub(crate) fn idle_stat(&self, period: u64) -> u8 {
+        let hibernate: u64 = self.inner.0.load(Ordering::Acquire);
+        let retire: u64 = self.inner.1.load(Ordering::Acquire);
 
-impl Drop for MaxIdle {
-    fn drop(&mut self) {
-        unsafe {
-            ptr::drop_in_place(&mut self.0);
+        match (hibernate, retire) {
+            (h, r) if h > 0 && r > 0 => {
+                if period < h {
+                    // ok
+                    0
+                } else if period < r {
+                    // hibernate
+                    1
+                } else {
+                    // retire
+                    2
+                }
+            }
+            (h, r) if h > 0 && r == 0 => {
+                if period < h {
+                    0
+                } else {
+                    1
+                }
+            }
+            (h, r) if h == 0 && r > 0 => {
+                if period < r {
+                    0
+                } else {
+                    2
+                }
+            }
+            _ => 0,
         }
     }
 }
 
-unsafe impl Send for MaxIdle {}
-unsafe impl Sync for MaxIdle {}
+impl Clone for IdleThreshold {
+    fn clone(&self) -> Self {
+        IdleThreshold {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+unsafe impl Send for IdleThreshold {}
+unsafe impl Sync for IdleThreshold {}
