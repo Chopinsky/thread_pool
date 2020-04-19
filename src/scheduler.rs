@@ -9,8 +9,9 @@ use crate::config::{Config, ConfigStatus, TimeoutPolicy};
 use crate::debug::is_debug_mode;
 use crate::manager::*;
 use crate::model::*;
-use channel::{SendError, SendTimeoutError, Sender, TryRecvError, TrySendError};
+
 use crossbeam_channel as channel;
+use channel::{SendError, SendTimeoutError, Sender, TryRecvError, TrySendError};
 
 const RETRY_LIMIT: u8 = 4;
 const CHAN_CAP: usize = 16;
@@ -648,11 +649,12 @@ impl PoolManager for ThreadPool {
         }
 
         let worker_count = self.manager.workers_count();
-        if target > worker_count {
-            self.extend(target - worker_count);
-        } else if target < worker_count {
-            self.shrink(worker_count - target);
-        }
+
+        match target {
+            x if x > worker_count => self.extend(x - worker_count),
+            x if x < worker_count => self.shrink(worker_count - x),
+            _ => {},
+        };
     }
 
     /// Automatically adjust the pool size according to criteria: if the pool is idling and we've
@@ -823,7 +825,7 @@ where
 
     fn spawn(&self, f: F) -> Result<(), ExecutionError> {
         let future = async move {
-            //            Task::get_current()
+            // Task::get_current()
             f.await
         };
 

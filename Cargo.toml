@@ -10,14 +10,14 @@ license = "MIT"
 edition = "2018"
 
 [dependencies]
+async-task = "1.0.0"
 crossbeam-channel = "^0.3.0"
+crossbeam-deque = "^0.7.0"
 hashbrown = "^0.1.8"
 parking_lot = "^0.7.1"
 
 [dev-dependencies]
 criterion = "0.2"
-futures-channel = "0.3.1"
-async-task = "1.0.0"
 
 [[bench]]
 name = "thread_pool_bench"

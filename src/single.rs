@@ -225,7 +225,7 @@ fn create(size: usize, config: Config) {
     };
 
     // Make the pool
-    let mut store = ThreadPool::new_with_config(size, config.clone());
+    let mut store = ThreadPool::new_with_config(size, config);
     store.toggle_auto_scale(auto_mode);
 
     // Put it in the heap so it can outlive this call

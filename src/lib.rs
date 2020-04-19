@@ -1,12 +1,17 @@
 mod config;
 mod debug;
-mod local_executor;
+mod executor;
 mod manager;
 mod model;
 mod multi;
 mod scheduler;
 mod single;
 mod worker;
+
+#[doc(hidden)]
+pub mod core_export {
+    pub use core::*;
+}
 
 pub use crate::{
     config::{Config, ConfigStatus, TimeoutPolicy},
