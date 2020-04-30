@@ -31,7 +31,7 @@ pub mod index_mode {
 
 pub mod prelude {
     pub use crate::index_mode::*;
-    pub use crate::scheduler::FuturesPool;
+    pub use crate::executor::block_on;
     pub use crate::shared_mode::*;
     pub use crate::*;
 }

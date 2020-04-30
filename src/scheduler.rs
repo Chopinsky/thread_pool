@@ -1,4 +1,3 @@
-use std::future::Future;
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::thread;
@@ -499,9 +498,6 @@ impl ThreadPool {
 
         let manager = Manager::build(config, pool_size, flag.clone(), pri_rx, rx, lazy_built);
 
-        //        let pool = LocalPool::new();
-        //        let spawner = pool.spawner();
-
         ThreadPool {
             manager,
             chan: (pri_tx, tx),
@@ -513,7 +509,6 @@ impl ThreadPool {
             non_blocking,
             queue_timeout: None,
             timeout_policy: policy,
-            //            local_pool: Some((pool, spawner)),
         }
     }
 }
@@ -802,34 +797,6 @@ impl PoolState for ThreadPool {
             0 => None,
             id => Some(id),
         }
-    }
-}
-
-pub trait FuturesPool<T, F>
-where
-    T: Send + 'static,
-    F: Future<Output = T> + Send + 'static,
-{
-    fn block_on(&mut self, f: F) -> Result<T, ExecutionError>;
-    fn spawn(&self, f: F) -> Result<(), ExecutionError>;
-}
-
-impl<T, F> FuturesPool<T, F> for ThreadPool
-where
-    T: Send + 'static,
-    F: Future<Output = T> + Send + 'static,
-{
-    fn block_on(&mut self, f: F) -> Result<T, ExecutionError> {
-        Err(ExecutionError::Uninitialized)
-    }
-
-    fn spawn(&self, f: F) -> Result<(), ExecutionError> {
-        let future = async move {
-            // Task::get_current()
-            f.await
-        };
-
-        Ok(())
     }
 }
 

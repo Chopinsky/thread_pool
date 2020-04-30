@@ -10,7 +10,8 @@ license = "MIT"
 edition = "2018"
 
 [dependencies]
-async-task = "1.0.0"
+async-task = "^3.0.0"
+crossbeam-utils = "^0.7.0"
 crossbeam-channel = "^0.3.0"
 crossbeam-deque = "^0.7.0"
 hashbrown = "^0.1.8"
