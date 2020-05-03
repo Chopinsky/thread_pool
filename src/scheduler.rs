@@ -19,6 +19,7 @@ const AUTO_EXTEND_TRIGGER_SIZE: usize = 2;
 
 /// Enumeration to indicate possible reasons a job execution request is rejected. User will need to
 /// resubmit the job again, since closure's state may have been stale at the execution error.
+#[derive(Debug)]
 pub enum ExecutionError {
     /// The job can't be executed because the queue is full when the new job is submitted and no new
     /// worker becomes available before predetermined timeout period.

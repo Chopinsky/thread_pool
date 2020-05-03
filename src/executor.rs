@@ -15,41 +15,40 @@ use crossbeam_utils::sync::Parker;
 
 #[macro_export]
 macro_rules! pin_mut {
-    ($($x:ident),*) => { $(
-        // Move the value to ensure that it is owned
-        let mut $x = $x;
+    ( $( $x:ident ), *) => {
+        $(
+            // Move the value to ensure that it is owned
+            let mut $x = $x;
 
-        // Shadow the original binding so that it can't be directly accessed
-        // ever again.
-        #[allow(unused_mut)]
-        let mut $x = unsafe {
-            $crate::core_export::pin::Pin::new_unchecked(&mut $x)
-        };
-    )* }
+            // Shadow the original binding so that it can't be directly accessed
+            // ever again.
+            #[allow(unused_mut)]
+            let mut $x = unsafe {
+                $crate::core_export::pin::Pin::new_unchecked(&mut $x)
+            };
+        ) *
+    }
 }
 
 pub fn block_on<T>(mut fut: impl Future<Output=T>) -> Result<T, ExecutionError> {
     thread_local! {
-            static CACHE: RefCell<(Parker, Waker)> = {
-                let parker = Parker::new();
-                let unparker = parker.unparker().clone();
-                let waker = async_task::waker_fn(move || unparker.unpark());
+        static CACHE: RefCell<(Parker, Waker)> = {
+            let parker = Parker::new();
+            let unparker = parker.unparker().clone();
+            let waker = async_task::waker_fn(move || unparker.unpark());
 
-                RefCell::new((parker, waker))
-            };
-        }
+            RefCell::new((parker, waker))
+        };
+    }
 
     CACHE.with(|cache| {
-        let (parker, waker) = &mut *cache.try_borrow_mut().expect("recursive entry forbidden");
-        let ctx = &mut Context::from_waker(&waker);
+        let (parker, waker) =
+            &mut *cache.try_borrow_mut().expect("recursive entry forbidden ... ");
 
         pin_mut!(fut);
 
-        // let mut fut = fut;
-        // let mut fut_pin = unsafe { Pin::new_unchecked(&mut fut) };
-
         loop {
-            match fut.as_mut().poll(ctx) {
+            match fut.as_mut().poll(&mut Context::from_waker(&waker)) {
                 Poll::Ready(val) => return Ok(val),
                 Poll::Pending => parker.park(),
             }
@@ -70,8 +69,6 @@ pub fn block_on<T>(mut fut: impl Future<Output=T>) -> Result<T, ExecutionError> 
 //         T: Send + 'static,
 //         F: Future<Output = T> + Send + 'static,
 // {
-//
-//
 //     fn spawn(&self, f: F) -> Result<(), ExecutionError> {
 //         let future = async move {
 //             // Task::get_current()
