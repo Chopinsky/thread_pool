@@ -4,7 +4,7 @@ mod executor;
 mod manager;
 mod model;
 mod multi;
-mod scheduler;
+mod pool;
 mod single;
 mod worker;
 
@@ -16,8 +16,11 @@ pub mod core_export {
 pub use crate::{
     config::{Config, ConfigStatus, TimeoutPolicy},
     manager::{StatusBehaviorSetter, StatusBehaviors},
-    scheduler::{
+    pool::{
         ExecutionError, Hibernation, PoolManager, PoolState, ThreadPool, ThreadPoolStates,
+    },
+    executor::{
+        block_on, FutPool,
     },
 };
 

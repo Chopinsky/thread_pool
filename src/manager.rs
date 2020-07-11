@@ -6,7 +6,7 @@ use crate::debug::is_debug_mode;
 use crate::model::{
     concede_update, reset_lock, spin_update, Backoff, Message, WorkerUpdate, EXPIRE_PERIOD,
 };
-use crate::scheduler::PoolStatus;
+use crate::pool::PoolStatus;
 use crate::worker::Worker;
 use crossbeam_channel::Receiver;
 use std::sync::Arc;

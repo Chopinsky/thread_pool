@@ -3,15 +3,17 @@
 use std::cell::RefCell;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc::RecvTimeoutError};
 use std::task::{Context, Poll, Waker};
-use std::thread::{self, Thread};
+use std::time::Duration;
+use std::thread::{self, Thread, JoinHandle};
 
 use crate::ExecutionError;
-use async_task::Task;
+use async_task::{Task};
 use crossbeam_deque::Worker;
 use crossbeam_channel as channel;
 use crossbeam_utils::sync::Parker;
+use crossbeam_channel::{Sender, Receiver};
 
 #[macro_export]
 macro_rules! pin_mut {
@@ -56,34 +58,44 @@ pub fn block_on<T>(mut fut: impl Future<Output=T>) -> Result<T, ExecutionError> 
     })
 }
 
-// pub trait FuturesPool<T, F>
-//     where
-//         T: Send + 'static,
-//         F: Future<Output = T> + Send + 'static,
-// {
-//     fn spawn(&self, f: F) -> Result<(), ExecutionError>;
-// }
-//
-// impl<T, F> FuturesPool<T, F> for ThreadPool
-//     where
-//         T: Send + 'static,
-//         F: Future<Output = T> + Send + 'static,
-// {
-//     fn spawn(&self, f: F) -> Result<(), ExecutionError> {
-//         let future = async move {
-//             // Task::get_current()
-//             f.await
-//         };
-//
-//         Ok(())
-//     }
-// }
+pub struct FutPool {
+    workers: Vec<Thread>,
+}
+
+impl FutPool {
+    pub fn spawn<F, R>(fut: F) -> Receiver<R>
+    where
+        F: Future<Output = R> + Send + 'static,
+        R: Send + 'static,
+    {
+        let (tx, rx): (Sender<R>, Receiver<R>) = channel::bounded(1);
+
+        let f = Box::pin(async move {
+            tx.send(fut.await).expect("failed to send the result back ... ")
+        });
+
+        //TODO: send the task to the pool of workers
+
+        rx
+    }
+}
+
+pub fn spawn<F, R>(fut: F) -> Receiver<R>
+where
+    F: Future<Output = R> + Send + 'static,
+    R: Send + 'static,
+{
+    let (tx, rx): (Sender<R>, Receiver<R>) = channel::bounded(1);
+
+    let f = Box::pin(async move {
+        tx.send(fut.await).expect("failed to send the result back ... ")
+    });
+
+    rx
+}
 
 thread_local! {
     static QUEUE: Arc<Worker<Task<()>>> = Arc::new(Worker::new_fifo());
-//    static NOTIFIER: Arc<ThreadNotifier> = Arc::new(ThreadNotifier {
-//        thread: thread::current(),
-//    });
 }
 
 pub(crate) fn enqueue<F, R>(future: F) -> channel::Receiver<R>

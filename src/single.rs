@@ -10,7 +10,7 @@ use std::time::Duration;
 use crate::config::{Config, ConfigStatus};
 use crate::debug::is_debug_mode;
 use crate::model::StaticStore;
-use crate::scheduler::{PoolManager, ThreadPool};
+use crate::pool::{PoolManager, ThreadPool};
 use parking_lot::{Once, OnceState, ONCE_INIT};
 
 /// Atomic flags
@@ -19,8 +19,6 @@ static CLOSING: AtomicBool = AtomicBool::new(false);
 
 /// The actual pool storage
 static mut POOL: StaticStore<Pool> = StaticStore::init();
-//static mut POOL: Option<Pool> = None;
-//static mut S_POOL: MaybeUninit<Pool> = MaybeUninit::new(Pool::default());
 
 struct Pool {
     store: ThreadPool,

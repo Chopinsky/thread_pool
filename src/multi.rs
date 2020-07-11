@@ -9,7 +9,7 @@ use std::time::Duration;
 use crate::config::{Config, ConfigStatus};
 use crate::debug::is_debug_mode;
 use crate::model::{concede_update, reset_lock, spin_update, Backoff, StaticStore};
-use crate::scheduler::{PoolManager, PoolState, ThreadPool};
+use crate::pool::{PoolManager, PoolState, ThreadPool};
 use hashbrown::{HashMap, HashSet};
 use parking_lot::{Once, OnceState, ONCE_INIT};
 

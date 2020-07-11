@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime};
 use crate::debug::is_debug_mode;
 use crate::manager::{IdleThreshold, StatusBehaviorDefinitions, StatusBehaviors};
 use crate::model::*;
-use crate::scheduler::PoolStatus;
+use crate::pool::PoolStatus;
 use crossbeam_channel as channel;
 
 const TIMEOUT: Duration = Duration::from_micros(16);
